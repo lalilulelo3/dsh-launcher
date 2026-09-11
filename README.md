@@ -9,6 +9,21 @@
 
 想用源码：克隆本仓库后双击 `启动器.bat`（或 `python launcher.py`）即可，无需安装任何第三方库。
 
+## 界面预览
+
+**主页** —— 版本检查、启动 / 停止、安全模式启动、插件开关与版本管理
+
+<img src="screenshots/01-home.png" width="640" alt="主页">
+
+| 备份与恢复 | 工具 |
+|---|---|
+| <img src="screenshots/02-backup.png" width="390" alt="备份与恢复"> | <img src="screenshots/03-tools.png" width="390" alt="工具"> |
+| 备份 / 重置 / 还原，插件清单导入导出 | 安装修复、诊断报告、环境信息 |
+
+**插件版本管理** —— 列出全部历史版本（含发布时间），既能升级、也能**回退**
+
+<img src="screenshots/04-plugin-versions.png" width="440" alt="插件版本管理">
+
 ## 它能做什么
 
 - 显示本机 DeepSeek Harness 的**当前版本**和 npm 仓库里的**最新版本**，发现新版本时提示更新；
