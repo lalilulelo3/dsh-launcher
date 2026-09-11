@@ -22,10 +22,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 安装 Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -39,7 +39,7 @@ jobs:
         run: python -m PyInstaller --noconfirm --clean -w -F -n DSH-Launcher launcher.py
 
       - name: 上传构建产物（即使发布失败也能在 Actions 页面下载）
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DSH-Launcher
           path: dist/DSH-Launcher.exe
