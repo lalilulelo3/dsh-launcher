@@ -1,0 +1,12 @@
+# 统一换行符，避免 Windows / Linux 用户互相看到满屏改动
+* text=auto eol=lf
+
+# Windows 批处理必须是 CRLF，否则可能无法执行
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制
+*.exe binary
+*.png binary
+*.jpg binary
+*.ico binary
