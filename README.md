@@ -171,6 +171,30 @@ pyinstaller -w -F -n DSH-Launcher launcher.py
 
 生成的 `dist/DSH-Launcher.exe` 即可直接双击运行。
 
+## 发布新版本（维护者）
+
+本项目已配置 **GitHub Actions**：只要推送一个版本标签，云端就会**自动打包 exe 并创建 Release**。
+
+1. 改完代码后，把 `launcher.py` 里的 `__version__` 改成新版本号（例如 `1.0.1`）；
+2. 提交并推送：
+
+```bat
+git add .
+git commit -m "修复：……"
+git push
+```
+
+3. 打标签并推送（**这一步会触发自动发版**）：
+
+```bat
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+约 1 分钟后，到 [Actions](../../actions) 页面可以看到进度；完成后会自动生成新 Release 并附上 exe。
+
+> 也可以在 Actions 页面点「构建并发布 Windows exe」→ **Run workflow**，手动填一个标签名来触发。
+
 ## 开源协议
 
 本项目采用 [MIT 协议](LICENSE)，可自由使用、修改和分发（保留版权声明即可）。
