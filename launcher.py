@@ -64,6 +64,9 @@ from backup import (
     load_last_good,
 )
 
+# 启动器自身的版本号（发布 Release 时与 git tag 对应）
+__version__ = "1.0.0"
+
 # 首次启动可能要走 npx 下载依赖，因此给足等待时间（秒）
 READY_TIMEOUT = 180
 # 日志面板保留的行数（也用于失败时展示错误摘要）
@@ -139,7 +142,7 @@ class App:
     # 界面构建
     # ------------------------------------------------------------------ #
     def _build_ui(self) -> None:
-        self.root.title("DeepSeek Harness 启动器")
+        self.root.title(f"DeepSeek Harness 启动器  v{__version__}")
         self.root.geometry("840x720")
         self.root.minsize(720, 600)
 
@@ -862,7 +865,7 @@ class App:
         except Exception:
             plugins, libraries = [], []
         lines = [
-            "DeepSeek Harness 启动器 —— 诊断报告",
+            f"DeepSeek Harness 启动器 —— 诊断报告（启动器 v{__version__}）",
             "生成时间：" + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "",
             "== 环境 ==",

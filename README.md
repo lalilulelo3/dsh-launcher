@@ -3,6 +3,12 @@
 一个用 Python + tkinter 写的 **DeepSeek Harness 启动器**，用于管理已安装的插件，
 尤其是当某个插件导致 Harness 启动失败时，能帮你**不删任何数据**地把它关掉再重试。
 
+## 下载
+
+**不想装 Python？** 直接到 [Releases](../../releases) 页面下载 `DSH-Launcher.exe`，双击即可运行。
+
+想用源码：克隆本仓库后双击 `启动器.bat`（或 `python launcher.py`）即可，无需安装任何第三方库。
+
 ## 它能做什么
 
 - 显示本机 DeepSeek Harness 的**当前版本**和 npm 仓库里的**最新版本**，发现新版本时提示更新；
