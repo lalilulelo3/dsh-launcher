@@ -98,6 +98,24 @@ def dsh_cmd() -> str:
     return "dsh"
 
 
+def child_env() -> dict:
+    """构造给子进程用的环境变量。
+
+    打包成 exe（PyInstaller）运行时，它会把 ``TCL_LIBRARY`` / ``TK_LIBRARY`` 指到
+    自己的临时解压目录（形如 ``...\\_MEIxxxxxx\\_tcl_data``）。这些是**打包器内部路径**，
+    绝不该传给子进程——否则从启动器里启动的 dsh、命令行窗口，以及它们的后代进程
+    （比如 AI 的 shell）都会指着一个可能已被删除的目录，导致任何 Python + tkinter
+    的程序报 ``Can't find a usable init.tcl``。
+
+    这里只清理"指向 _MEI 目录"的那种值，用户自己正经设置的不动。
+    """
+    env = dict(os.environ)
+    for key in ("TCL_LIBRARY", "TK_LIBRARY"):
+        if "_MEI" in env.get(key, ""):
+            env.pop(key, None)
+    return env
+
+
 def run_command(cmd: str, timeout: float = 60.0) -> subprocess.CompletedProcess:
     """同步执行一条命令（经 cmd 解释），返回带 stdout/stderr 的 CompletedProcess。
 
@@ -112,6 +130,7 @@ def run_command(cmd: str, timeout: float = 60.0) -> subprocess.CompletedProcess:
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        env=child_env(),
     )
 
 
@@ -250,6 +269,7 @@ def stream_command(cmd: str, line_callback, timeout: float | None = None) -> int
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        env=child_env(),
     )
     try:
         if proc.stdout is not None:
@@ -276,7 +296,7 @@ def launch_in_console(cmd: str, title: str = "DeepSeek Harness") -> None:
     不捕获输出、不托管进程——就是把控制台原原本本交还给用户，
     相当于你以前双击的那个批处理。
     """
-    subprocess.Popen(f'start "{title}" cmd /k "{cmd}"', shell=True)
+    subprocess.Popen(f'start "{title}" cmd /k "{cmd}"', shell=True, env=child_env())
 
 
 class HarnessProcess:
@@ -311,6 +331,7 @@ class HarnessProcess:
             encoding="utf-8",
             errors="replace",
             bufsize=1,                  # 行缓冲，便于实时看到日志
+            env=child_env(),            # 不把打包器的 Tcl 临时路径泄漏给 dsh
         )
         self._reader_thread = threading.Thread(target=self._read_output, daemon=True)
         self._reader_thread.start()

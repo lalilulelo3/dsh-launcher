@@ -205,6 +205,8 @@ class App:
 
         canvas = tk.Canvas(box, highlightthickness=0)
         self._plugin_canvas = canvas
+        # Canvas 不会自动处理鼠标滚轮，必须显式绑定（见 _on_plugin_wheel）
+        canvas.bind("<MouseWheel>", self._on_plugin_wheel)
         scrollbar = ttk.Scrollbar(box, orient="vertical", command=canvas.yview)
         self.plugin_frame = ttk.Frame(canvas)
         self.plugin_frame.bind(
@@ -495,7 +497,33 @@ class App:
                       foreground="#888").pack(anchor="w")
             for p in libraries:
                 self._render_library_row(p)
+        # 行内子控件会"吃掉"滚轮事件，所以要给它们逐个补绑
+        self._bind_wheel(self.plugin_frame)
         self._set_status(f"共 {len(plugins)} 个插件，{len(libraries)} 个库依赖")
+
+    # —— 鼠标滚轮：Canvas 不会自动响应，必须手动处理 ——
+    def _on_plugin_wheel(self, event) -> None:
+        """滚动插件列表。Windows 下每格滚轮 delta 为 ±120。"""
+        canvas = getattr(self, "_plugin_canvas", None)
+        if canvas is None:
+            return
+        delta = getattr(event, "delta", 0)
+        steps = int(-delta / 120)
+        if steps == 0:                       # 有些鼠标 delta 很小，兜底为 1 格
+            steps = -1 if delta > 0 else 1
+        try:
+            canvas.yview_scroll(steps, "units")
+        except Exception:
+            pass
+
+    def _bind_wheel(self, widget) -> None:
+        """递归给控件及其所有子控件绑定滚轮事件。"""
+        try:
+            widget.bind("<MouseWheel>", self._on_plugin_wheel)
+        except Exception:
+            pass
+        for child in widget.winfo_children():
+            self._bind_wheel(child)
 
     def _render_plugin_row(self, p) -> None:
         row = ttk.Frame(self.plugin_frame, padding=(2, 6))
@@ -507,10 +535,16 @@ class App:
             command=lambda name=p.name, v=var: self._on_toggle(name, v),
         )
         cb.pack(side="left", anchor="n")
+        btn_bar = ttk.Frame(row)
+        btn_bar.pack(side="right", anchor="n")
         ttk.Button(
-            row, text="版本…", width=7,
+            btn_bar, text="卸载…", width=7,
+            command=lambda name=p.name: self.on_uninstall_plugin(name),
+        ).pack(side="right")
+        ttk.Button(
+            btn_bar, text="版本…", width=7,
             command=lambda name=p.name, ver=p.version: self.on_check_update(name, ver),
-        ).pack(side="right", anchor="n")
+        ).pack(side="right", padx=(0, 6))
 
         info = ttk.Frame(row)
         info.pack(side="left", fill="x", expand=True, padx=(6, 0))
@@ -707,6 +741,47 @@ class App:
             messagebox.showinfo("完成", "插件更新完成，正在刷新列表。")
         else:
             messagebox.showerror("失败", f"插件更新失败（退出码 {code}），请查看下方日志。")
+        self.refresh_plugins()
+
+    # ------------------------------------------------------------------ #
+    # 彻底删除插件
+    # ------------------------------------------------------------------ #
+    def on_uninstall_plugin(self, pkg: str) -> None:
+        """彻底删除某个插件：移除它的依赖与文件（不可撤销）。"""
+        if self.harness.is_running():
+            if not messagebox.askyesno(
+                "卸载插件",
+                "Harness 正在运行中，卸载会删除它正在使用的文件。\n\n"
+                "是否先停止 Harness？",
+            ):
+                return
+            self.on_stop()
+        if not messagebox.askyesno(
+            "彻底删除插件",
+            f"将从 web 档案中彻底删除：\n\n    {pkg}\n\n"
+            "这会移除它的依赖与文件，之后启动器列表里也不会再有它。\n"
+            "（删除前会自动备份一次档案，日后可用「恢复备份…」找回配置）\n\n"
+            "确定要删除吗？",
+        ):
+            return
+        try:                                  # 先留一份“后悔药”
+            create_backup(label=f"删除 {pkg} 前自动备份", include_sessions=False)
+            self.refresh_backup_list()
+        except Exception:
+            pass
+        cmd = f'{dsh_cmd()} plugin --profile web remove "{pkg}"'
+        self._run_async(cmd, f"删除插件 {pkg}",
+                        on_done=lambda code: self._after_uninstall(code, pkg))
+
+    def _after_uninstall(self, code: int, pkg: str) -> None:
+        if code == 0:
+            try:
+                set_package_enabled(pkg, True)   # 从启动器的“已禁用”记录里清掉它
+            except Exception:
+                pass
+            messagebox.showinfo("完成", f"{pkg} 已彻底删除，正在刷新列表。")
+        else:
+            messagebox.showerror("失败", f"删除失败（退出码 {code}），请查看下方日志。")
         self.refresh_plugins()
 
     # ------------------------------------------------------------------ #
