@@ -65,7 +65,7 @@ from backup import (
 )
 
 # 启动器自身的版本号（发布 Release 时与 git tag 对应）
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # 首次启动可能要走 npx 下载依赖，因此给足等待时间（秒）
 READY_TIMEOUT = 180
