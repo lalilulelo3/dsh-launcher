@@ -5,6 +5,12 @@
 - “用户插件” = ``profiles/web/package.json`` 里 ``dependencies`` 字段的键。
   其中同时出现在 ``dsh.profile.bundles`` 里的才是“插件层”（会影响启动、可开关），
   其余是普通“库依赖”（一般不参与启动，不可开关）。
+- **但有一类特殊的“不一致”状态**：包声明了插件层（``package.json`` 里有
+  ``dsh.bundle.patch``）、文件也装进了 ``node_modules``，却**没有**登记到
+  ``dsh.profile.bundles``。此时它不会参与启动，效果是「装了但不生效」。
+  成因见 ``core.approve_builds_cmd()`` 的说明（pnpm 因构建脚本拦截而中途失败，
+  dsh 只在 pnpm 成功时才登记插件层）。这类包必须与纯库依赖分开显示，
+  否则用户唯一的线索就没了。
 - “开关”不是删文件，也不是改 DSH 的配置文件，而是：
   启动器在 ``~/.dsh/launcher/disabled.patch.yml`` 里生成一个补丁，启动时用
   ``dsh web --patch <该文件>`` 把它叠加上去。这样禁用是**可逆**的，且**不会碰坏**
@@ -19,6 +25,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from core import (
     profile_package_json,
@@ -37,9 +44,19 @@ class Plugin:
     version: str       # 已安装版本
     description: str   # 简介
     homepage: str      # 项目主页（可能为空）
-    is_bundle: bool    # 是否是“插件层”（可开关）
+    is_bundle: bool    # 是否已登记为“插件层”（可开关）
     entry_ids: list    # 该包在 Loader 里的条目 id（用于开关）
     enabled: bool      # 当前是否启用
+    declares_bundle: bool = False   # 包自身是否声明了插件层（dsh.bundle.patch）
+
+
+class Inventory(NamedTuple):
+    """一次插件清点的完整结果（``list_plugins()`` 的返回值）。"""
+    plugins: list      # 插件层：已登记，会参与启动，可开关
+    unmounted: list    # 已安装但未登记：声明了插件层却没挂载，需要修复
+    libraries: list    # 纯库依赖：被插件依赖，不参与启动
+    dump_error: str    # ``--dump-config`` 的失败原因；成功时为空字符串
+
 
 
 def _read_json(path: Path) -> dict:
@@ -85,14 +102,64 @@ def _repo_url(data: dict) -> str:
     return url
 
 
+def _declares_bundle(data: dict) -> bool:
+    """判断一个 package.json 是否声明了插件层（``dsh.bundle``）。
+
+    插件包的写法通常是 ``"dsh": {"bundle": {"patch": "./cordis.patch.yml"}}``。
+    这里对几种可能写法都做兼容，判定失败一律当作“没声明”（宁可归到库依赖，
+    也不要凭空把普通库标成“待修复”去打扰用户）。
+    """
+    dsh = data.get("dsh")
+    if not isinstance(dsh, dict):
+        return False
+    bundle = dsh.get("bundle")
+    if bundle is True:
+        return True
+    if isinstance(bundle, str):
+        return bool(bundle.strip())
+    if isinstance(bundle, dict):
+        patch = bundle.get("patch")
+        return bool(str(patch or "").strip())
+    return False
+
+
 def _plugin_metadata(pkg: str) -> dict:
-    """读取某个插件的 package.json，取版本/简介/主页。"""
+    """读取某个插件的 package.json，取版本/简介/主页/是否声明插件层。"""
     data = _read_json(profile_dir() / "node_modules" / pkg / "package.json")
     return {
         "version": data.get("version", "?"),
         "description": data.get("description", ""),
         "homepage": data.get("homepage") or _repo_url(data),
+        "declares_bundle": _declares_bundle(data),
     }
+
+
+_IGNORED_BUILDS_RE = re.compile(
+    r"Ignored build scripts?:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE
+)
+
+
+def ignored_build_packages(output) -> list:
+    """从 pnpm 的输出里解析「因构建脚本被拦截而被拒绝安装」的包名。
+
+    pnpm 的原文形如::
+
+        [ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: node-pty@1.1.0
+        Run "pnpm approve-builds" to pick which dependencies should be allowed to run scripts.
+
+    返回 ``['node-pty@1.1.0']`` 这样带版本号的条目（pnpm 就是这么打印的，
+    有的版本还会用逗号分隔多个包）。识别不出时返回空列表。
+    """
+    text = "\n".join(output) if isinstance(output, (list, tuple)) else str(output or "")
+    if "ERR_PNPM_IGNORED_BUILDS" not in text and "Ignored build scripts" not in text:
+        return []
+    names = []
+    for m in _IGNORED_BUILDS_RE.finditer(text):
+        for part in m.group(1).split(","):
+            part = part.strip().strip("'\"")
+            if part and part not in names:
+                names.append(part)
+    return names
 
 
 def _parse_dump(raw: str | None) -> list:
@@ -262,19 +329,27 @@ def prune_stale_disables(installed: list) -> dict:
     return disabled
 
 
-def list_plugins() -> tuple:
-    """返回 (插件列表, 库依赖列表)。
+def list_plugins() -> Inventory:
+    """清点已安装的包，返回 :class:`Inventory`。
 
-    插件列表里的每个 Plugin 都带上了该包的条目 id 与当前启用状态，
-    供界面渲染开关。
+    分三类：
+
+    - ``plugins``：已登记为插件层 ⇒ 参与启动，可开关；
+    - ``unmounted``：**声明了插件层却没登记** ⇒ 装了但不生效，需要修复；
+    - ``libraries``：纯库依赖 ⇒ 不参与启动，不可开关。
+
+    ``dump_error`` 非空表示 ``--dump-config`` 没跑成功，此时 ``entry_ids``
+    必然全为空、开关会失灵——调用方**必须**把这件事显性告诉用户。
     """
     pkgs = installed_packages()
     bundles = set(bundles_list())
     disabled = prune_stale_disables(pkgs)
-    entries = _parse_dump(dump_config())
+    raw, dump_error = dump_config()
+    entries = _parse_dump(raw)
     id_map = _entry_ids_by_package(entries, pkgs)
 
     plugins = []
+    unmounted = []
     libraries = []
     for pkg in pkgs:
         meta = _plugin_metadata(pkg)
@@ -287,9 +362,13 @@ def list_plugins() -> tuple:
             is_bundle=is_bundle,
             entry_ids=id_map.get(pkg, []),
             enabled=pkg not in disabled,
+            declares_bundle=meta["declares_bundle"],
         )
         if is_bundle:
             plugins.append(p)
+        elif p.declares_bundle:
+            unmounted.append(p)
         else:
             libraries.append(p)
-    return plugins, libraries
+    return Inventory(plugins=plugins, unmounted=unmounted,
+                     libraries=libraries, dump_error=dump_error or "")

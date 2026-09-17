@@ -42,6 +42,7 @@ from core import (
     profile_dir,
     ui_settings_path,
     run_command,
+    approve_builds_cmd,
 )
 from plugins import (
     list_plugins,
@@ -50,6 +51,9 @@ from plugins import (
     write_disabled_patch,
     write_safe_mode_patch,
     set_disabled_map,
+    ignored_build_packages,
+    bundles_list,
+    Inventory,
 )
 from backup import (
     create_backup,
@@ -65,7 +69,7 @@ from backup import (
 )
 
 # 启动器自身的版本号（发布 Release 时与 git tag 对应）
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 # 首次启动可能要走 npx 下载依赖，因此给足等待时间（秒）
 READY_TIMEOUT = 180
@@ -119,6 +123,10 @@ class App:
         self.plugin_entry_ids = {}     # 包名 -> 条目 id 列表（渲染时缓存，供开关使用）
         self._ready_url = None         # DSH 启动成功后打印的带 token 访问地址
         self._current_plugins = []     # 最近一次渲染出来的插件列表（供“检查全部更新”使用）
+        self._current_unmounted = []   # 最近一次渲染出来的“已安装但未挂载”列表
+        self._last_cmd_output = []     # 最近一条后台命令的输出行（用于分析失败原因）
+        self._bundles_before = []      # 命令执行前的插件层清单（用于判断“需要重启”）
+        self._restart_deadline = 0.0   # 自动重启时等待端口释放的截止时间
         self.ui_settings = _load_ui_settings()
         self.dark_mode = bool(self.ui_settings.get("dark", False))
         self.dark_var = tk.BooleanVar(value=self.dark_mode)
@@ -339,7 +347,7 @@ class App:
         elif tag == "update_done":
             self._on_update_done(item[1])
         elif tag == "plugins":
-            self._render_plugins(item[1], item[2])
+            self._render_plugins(item[1])
         elif tag == "plugins_error":
             self._set_status("读取插件列表失败，请检查网络后重试")
             self._append_log("读取插件列表失败：" + str(item[1]))
@@ -472,8 +480,8 @@ class App:
 
     def _refresh_thread(self) -> None:
         try:
-            plugins, libraries = list_plugins()
-            self._post(("plugins", plugins, libraries))
+            inv = list_plugins()
+            self._post(("plugins", inv))
         except Exception as exc:  # noqa: BLE001
             self._post(("plugins_error", exc))
 
@@ -482,15 +490,51 @@ class App:
             child.destroy()
         self.plugin_vars.clear()
 
-    def _render_plugins(self, plugins, libraries) -> None:
+    def _render_plugins(self, inv) -> None:
         self._clear_plugin_frame()
-        self._current_plugins = list(plugins)
-        if not plugins and not libraries:
+        plugins = list(inv.plugins)
+        unmounted = list(inv.unmounted)
+        libraries = list(inv.libraries)
+        self._current_plugins = plugins
+        self._current_unmounted = unmounted
+        if not plugins and not unmounted and not libraries:
             ttk.Label(self.plugin_frame, text="暂未安装任何插件。\n可以在「工具」选项卡里安装插件，装好后点「刷新」。",
                       foreground="#888").pack(anchor="w", pady=10)
+        # --dump-config 失败 ⇒ 所有条目 id 为空 ⇒ 开关会静默失灵。
+        # 这种情况必须显性告警，绝不能和「确实没有条目」长得一样。
+        if inv.dump_error:
+            warn = ttk.Frame(self.plugin_frame, padding=(6, 6))
+            warn.pack(fill="x", pady=(0, 6))
+            ttk.Label(
+                warn,
+                text="⚠ 无法解析插件条目，下面的「开关」暂时不可用。",
+                font=("Microsoft YaHei UI", 10, "bold"), foreground="#c0392b",
+            ).pack(anchor="w")
+            ttk.Label(
+                warn,
+                text=f"原因：{inv.dump_error}\n"
+                     "常见于档案目录不可写（权限、只读、被安全软件或其它进程占用）。\n"
+                     "排查后可点「刷新」重试；详细输出见下方运行日志。",
+                foreground="#b26a00", justify="left", wraplength=760,
+            ).pack(anchor="w")
+            self._append_log(f"[启动器] 警告：导出插件条目失败 —— {inv.dump_error}")
         self.plugin_entry_ids = {p.name: p.entry_ids for p in plugins}
         for p in plugins:
             self._render_plugin_row(p)
+        if unmounted:
+            ttk.Separator(self.plugin_frame, orient="horizontal").pack(fill="x", pady=8)
+            ttk.Label(
+                self.plugin_frame,
+                text="⚠ 已安装但未挂载（声明了插件层却没登记，因此不会生效）：",
+                font=("Microsoft YaHei UI", 10, "bold"), foreground="#c0392b",
+            ).pack(anchor="w")
+            ttk.Label(
+                self.plugin_frame,
+                text="点右边的「修复」即可：放行被拦下的构建脚本，再重新登记一次。",
+                foreground="#b26a00",
+            ).pack(anchor="w")
+            for p in unmounted:
+                self._render_unmounted_row(p)
         if libraries:
             ttk.Separator(self.plugin_frame, orient="horizontal").pack(fill="x", pady=8)
             ttk.Label(self.plugin_frame, text="库依赖（非插件层，不影响启动，不可开关）：",
@@ -499,7 +543,12 @@ class App:
                 self._render_library_row(p)
         # 行内子控件会"吃掉"滚轮事件，所以要给它们逐个补绑
         self._bind_wheel(self.plugin_frame)
-        self._set_status(f"共 {len(plugins)} 个插件，{len(libraries)} 个库依赖")
+        parts = [f"共 {len(plugins)} 个插件"]
+        if unmounted:
+            parts.append(f"{len(unmounted)} 个未挂载")
+        parts.append(f"{len(libraries)} 个库依赖")
+        self._set_status("，".join(parts))
+
 
     # —— 鼠标滚轮：Canvas 不会自动响应，必须手动处理 ——
     def _on_plugin_wheel(self, event) -> None:
@@ -562,6 +611,38 @@ class App:
     def _render_library_row(self, p) -> None:
         ttk.Label(self.plugin_frame, text=f"• {p.name}  v{p.version}",
                   foreground="#999", padding=(20, 1)).pack(anchor="w")
+
+    def _render_unmounted_row(self, p) -> None:
+        """渲染一个「已安装但未挂载」的插件：只给「修复」和「卸载」。"""
+        row = ttk.Frame(self.plugin_frame, padding=(2, 6))
+        row.pack(fill="x", pady=3)
+        btn_bar = ttk.Frame(row)
+        btn_bar.pack(side="right", anchor="n")
+        ttk.Button(
+            btn_bar, text="卸载…", width=7,
+            command=lambda name=p.name: self.on_uninstall_plugin(name),
+        ).pack(side="right")
+        ttk.Button(
+            btn_bar, text="修复", width=7,
+            command=lambda name=p.name: self.on_repair_plugin(name),
+        ).pack(side="right", padx=(0, 6))
+
+        info = ttk.Frame(row)
+        info.pack(side="left", fill="x", expand=True)
+        ttk.Label(info, text=f"{p.name}   v{p.version}",
+                  font=("Microsoft YaHei UI", 10, "bold"), foreground="#c0392b").pack(anchor="w")
+        ttk.Label(
+            info,
+            text="它自己声明了插件层，但没有出现在档案的插件层清单里，"
+                 "所以 Harness 根本不会加载它（装了也不生效）。",
+            wraplength=540, foreground="#b26a00", justify="left",
+        ).pack(anchor="w")
+        if p.description:
+            ttk.Label(info, text=p.description, wraplength=540, foreground="#444").pack(anchor="w")
+        if p.homepage:
+            link = ttk.Label(info, text="项目主页 ↗", **LINK_STYLE)
+            link.pack(anchor="w")
+            link.bind("<Button-1>", lambda e, url=p.homepage: webbrowser.open(url))
 
     def _on_toggle(self, name: str, var: tk.BooleanVar) -> None:
         enabled = var.get()
@@ -734,14 +815,23 @@ class App:
             if choice:
                 self.on_stop()
         cmd = f'{dsh_cmd()} plugin --profile web add "{pkg}@{version}"'
-        self._run_async(cmd, f"更新插件 {pkg} → {version}", on_done=self._after_plugin_update)
+        self._run_async(cmd, f"更新插件 {pkg} → {version}",
+                        on_done=lambda code: self._after_plugin_update(code, pkg))
 
-    def _after_plugin_update(self, code: int) -> None:
+    def _after_plugin_update(self, code: int, pkg: str = "") -> None:
         if code == 0:
-            messagebox.showinfo("完成", "插件更新完成，正在刷新列表。")
-        else:
-            messagebox.showerror("失败", f"插件更新失败（退出码 {code}），请查看下方日志。")
+            self._finish_plugin_change("插件更新完成")
+            return
+        if self._maybe_offer_repair(pkg, "更新"):
+            return
+        messagebox.showerror(
+            "失败",
+            f"插件更新失败（退出码 {code}）。\n\n"
+            f"命令最后几行输出：\n{self._command_output_tail() or '（无）'}\n\n"
+            "完整输出见下方「运行日志」。",
+        )
         self.refresh_plugins()
+
 
     # ------------------------------------------------------------------ #
     # 彻底删除插件
@@ -788,15 +878,39 @@ class App:
     # 工具：在启动器里直接执行常用命令（不用另外开命令行）
     # ------------------------------------------------------------------ #
     def _run_async(self, cmd: str, label: str, on_done=None) -> None:
-        """后台运行一条命令，输出实时打到日志面板；结束（主线程）回调 on_done(退出码)。"""
+        """后台运行一条命令，输出实时打到日志面板；结束（主线程）回调 on_done(退出码)。
+
+        同时做两件对“事后判断”很关键的事：
+
+        - 把输出**留一份**在 ``self._last_cmd_output``，这样失败回调能拿到真实原因
+          （例如 pnpm 的 ``ERR_PNPM_IGNORED_BUILDS``），而不是只有一个退出码；
+        - 记下执行前的插件层清单，结束后一对比就知道“是否需要重启 Harness”。
+        """
         self._append_log(f"[启动器] 运行命令：{cmd}")
         self._set_status(f"正在执行：{label} …")
+        self._last_cmd_output = []
+        try:
+            self._bundles_before = bundles_list()
+        except Exception:
+            self._bundles_before = []
 
         def worker():
-            code = stream_command(cmd, lambda line: self._post(("log", line)))
+            lines = []
+
+            def on_line(line: str) -> None:
+                lines.append(line)
+                self._post(("log", line))
+
+            code = stream_command(cmd, on_line)
+            self._last_cmd_output = lines
             self._post(("cmd_done", label, code, on_done))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _command_output_tail(self, limit: int = 6) -> str:
+        """把最近一条命令的尾部输出拼成一行，用于错误提示里给点线索。"""
+        lines = [ln.strip() for ln in (self._last_cmd_output or []) if ln.strip()]
+        return "\n".join(lines[-limit:])
 
     def on_install_dsh(self) -> None:
         """安装 / 修复全局 DSH（npm install -g @deepseek-ai/dsh@latest）。"""
@@ -828,14 +942,158 @@ class App:
             return
         pkg = pkg.strip()
         self._run_async(f'{dsh_cmd()} plugin --profile web add "{pkg}"',
-                        f"安装插件 {pkg}", on_done=self._after_install_plugin)
+                        f"安装插件 {pkg}",
+                        on_done=lambda code: self._after_install_plugin(code, pkg))
 
-    def _after_install_plugin(self, code: int) -> None:
+    def _after_install_plugin(self, code: int, pkg: str = "") -> None:
         if code == 0:
-            messagebox.showinfo("完成", "插件安装完成，正在刷新列表。")
-        else:
-            messagebox.showerror("失败", f"插件安装失败（退出码 {code}），请查看下方日志。")
+            self._finish_plugin_change("插件安装完成")
+            return
+        if self._maybe_offer_repair(pkg, "安装"):
+            return
+        messagebox.showerror(
+            "失败",
+            f"插件安装失败（退出码 {code}）。\n\n"
+            f"命令最后几行输出：\n{self._command_output_tail() or '（无）'}\n\n"
+            "完整输出见下方「运行日志」。",
+        )
         self.refresh_plugins()
+
+    # ------------------------------------------------------------------ #
+    # 「已安装但未挂载」的修复 + 插件层变动后的重启提示
+    # ------------------------------------------------------------------ #
+    def _maybe_offer_repair(self, pkg: str, action: str) -> bool:
+        """判断这次失败是不是「pnpm 拦下构建脚本」这一特定原因。
+
+        是的话给出可操作提示（并可一键修复），返回 True；
+        不是（或拿不到包名）返回 False，由调用方弹通用的失败提示。
+        """
+        blocked = ignored_build_packages(self._last_cmd_output)
+        if not blocked or not pkg:
+            return False
+        if messagebox.askyesno(
+            f"{action}没有完成 —— 发现可修复的原因",
+            f"{action}没有完成：pnpm 拦下了依赖的安装脚本。\n\n"
+            "    被拦下的包：" + "、".join(blocked) + "\n\n"
+            "pnpm 11 默认开启 strictDepBuilds（供应链保护）：碰到带原生依赖的包时，\n"
+            "它会拒绝执行这些包的安装脚本，并让命令以非 0 退出。\n\n"
+            "这里有个关键点：pnpm 在报错**之前**就已经把插件写进了档案的依赖清单、\n"
+            "文件也放进 node_modules 了，而 Harness 只在命令成功时才登记「插件层」。\n"
+            "于是它会停在「已安装但未挂载」的半成品状态——列表里看得到，却完全不生效。\n\n"
+            "是否现在自动修复？",
+        ):
+            self.on_repair_plugin(pkg, blocked)
+        else:
+            self.refresh_plugins()
+        return True
+
+    def on_repair_plugin(self, pkg: str, blocked: list | None = None) -> None:
+        """一键修复「已安装但未挂载」：放行构建脚本 → 重新登记插件层。"""
+        blocked = list(blocked or [])
+        detail = ("被拦下的构建脚本：" + "、".join(blocked) + "\n\n") if blocked else ""
+        if not messagebox.askyesno(
+            "修复插件登记",
+            f"将修复：{pkg}\n\n"
+            f"{detail}"
+            "启动器会依次执行两步（都在 web 档案目录里，不改动 Harness 自己的配置文件）：\n\n"
+            "  1. pnpm approve-builds --all\n"
+            "     放行被拦下的依赖安装脚本（把档案目录 pnpm-workspace.yaml 里\n"
+            "     allowBuilds 的占位值 \"set this to true or false\" 改成 true）。\n"
+            "     安全提示：这等于信任这些包在安装时执行的脚本；\n"
+            "     插件不带原生依赖时不会出现这一步，也就不需要它。\n\n"
+            f"  2. dsh plugin --profile web add {pkg}\n"
+            "     重新走一遍安装，让 Harness 把插件层登记上。\n\n"
+            "修复后需要重启 Harness 才会真正生效。继续吗？",
+        ):
+            return
+        if self.harness.is_running():
+            if not messagebox.askyesno(
+                "先停止 Harness",
+                "修复会改动 Harness 正在使用的文件。\n\n是否先停止 Harness？",
+            ):
+                return
+            self.on_stop()
+        cmd = f'{approve_builds_cmd()} && {dsh_cmd()} plugin --profile web add "{pkg}"'
+        self._run_async(cmd, f"修复插件登记 {pkg}",
+                        on_done=lambda code: self._after_repair(code, pkg))
+
+    def _after_repair(self, code: int, pkg: str) -> None:
+        if code == 0:
+            self._finish_plugin_change(f"{pkg} 的插件登记已修复")
+            return
+        messagebox.showerror(
+            "修复未成功",
+            f"修复命令退出码 {code}。\n\n"
+            f"最后几行输出：\n{self._command_output_tail() or '（无）'}\n\n"
+            "也可以手动试一次——在 web 档案目录里依次执行：\n"
+            "    pnpm approve-builds --all\n"
+            f"    dsh plugin --profile web add {pkg}\n\n"
+            "完整输出见下方「运行日志」。",
+        )
+        self.refresh_plugins()
+
+    def _finish_plugin_change(self, action: str) -> None:
+        """插件层发生变动后的统一收尾：提示是否需要重启，然后刷新列表。
+
+        插件层（``dsh.profile.bundles``）是在 Harness **启动时**加载的，
+        装完插件只刷新浏览器没有用——这里主动把这件事说清楚。
+        """
+        try:
+            after = bundles_list()
+        except Exception:
+            after = []
+        before = list(self._bundles_before or [])
+        added = [x for x in after if x not in before]
+        removed = [x for x in before if x not in after]
+        if not added and not removed:
+            messagebox.showinfo("完成", f"{action}，正在刷新列表。")
+            self.refresh_plugins()
+            return
+        detail = ""
+        if added:
+            detail += "新增插件层：" + "、".join(added) + "\n"
+        if removed:
+            detail += "移除插件层：" + "、".join(removed) + "\n"
+        if self.harness.is_running():
+            restart = messagebox.askyesno(
+                "完成（需要重启才生效）",
+                f"{action}。\n\n{detail}\n"
+                "插件层是 Harness 启动时加载的，光刷新浏览器不管用。\n\n"
+                "是否现在自动重启 Harness？\n"
+                "（会先停止当前进程，等端口释放后自动重新启动）",
+            )
+            self.refresh_plugins()
+            if restart:
+                self._restart_dsh()
+        else:
+            messagebox.showinfo(
+                "完成（下次启动生效）",
+                f"{action}。\n\n{detail}\n"
+                "插件层在启动时加载，所以下次点「启动 Harness」就会带上它。",
+            )
+            self.refresh_plugins()
+
+    def _restart_dsh(self) -> None:
+        """停止后重新启动 Harness（用于「插件层变了，必须重启」）。"""
+        self._append_log("[启动器] 正在重启 Harness 以加载新的插件层 …")
+        try:
+            self.on_stop()
+        except Exception:
+            pass
+        self._restart_deadline = time.time() + 30
+        self.root.after(800, self._restart_when_port_free)
+
+    def _restart_when_port_free(self) -> None:
+        """等端口真正释放后再启动，避免撞上「端口已被占用」的提示。"""
+        if is_port_open(WEB_PORT):
+            if time.time() < self._restart_deadline:
+                self.root.after(500, self._restart_when_port_free)
+                return
+            self._append_log("[启动器] 端口仍被占用，已取消自动重启；稍后可手动点「启动 Harness」。")
+            self._set_status("已停止（端口仍被占用，请稍后手动启动）")
+            return
+        self.on_launch()
+
 
     def on_run_command(self) -> None:
         """运行任意命令（高级用法），输出显示在日志面板。"""
@@ -936,9 +1194,9 @@ class App:
 
     def _diag_thread(self, path: str) -> None:
         try:
-            plugins, libraries = list_plugins()
-        except Exception:
-            plugins, libraries = [], []
+            inv = list_plugins()
+        except Exception as exc:  # noqa: BLE001
+            inv = Inventory([], [], [], f"清点插件时出错：{exc}")
         lines = [
             f"DeepSeek Harness 启动器 —— 诊断报告（启动器 v{__version__}）",
             "生成时间：" + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -960,16 +1218,27 @@ class App:
                 lines.append(f"{tool}：{(proc.stdout or '').strip() or '未知'}")
             except Exception:
                 lines.append(f"{tool}：查询失败")
-        lines += ["", "== 已安装插件 =="]
-        if plugins:
-            for p in plugins:
+        lines += ["", "== 插件层（会参与启动，可开关）=="]
+        if inv.plugins:
+            for p in inv.plugins:
                 lines.append(f"{p.name}  v{p.version}  [{'启用' if p.enabled else '已禁用'}]")
         else:
             lines.append("（无）")
-        if libraries:
-            lines += ["", "== 库依赖 =="]
-            for p in libraries:
+        if inv.unmounted:
+            lines += ["", "== 已安装但未挂载（声明了插件层却没登记，不会生效）=="]
+            for p in inv.unmounted:
                 lines.append(f"{p.name}  v{p.version}")
+        if inv.libraries:
+            lines += ["", "== 库依赖 =="]
+            for p in inv.libraries:
+                lines.append(f"{p.name}  v{p.version}")
+        lines += ["", "== 插件条目解析（--dump-config）=="]
+        if inv.dump_error:
+            lines.append("失败：" + inv.dump_error)
+            lines.append("（注意：此时所有插件的「开关」都不可用。）")
+        else:
+            total = sum(len(p.entry_ids) for p in inv.plugins)
+            lines.append(f"成功，共定位到 {total} 个条目 id。")
         lines += ["", "== 最近日志 =="]
         lines.extend(self.log_tail)
         try:
@@ -1358,9 +1627,21 @@ class App:
 
     def _after_import_install(self, code: int) -> None:
         if code == 0:
-            messagebox.showinfo("完成", "插件安装完成，正在刷新列表。")
-        else:
-            messagebox.showerror("失败", f"安装失败（退出码 {code}），请查看下方日志。")
+            self._finish_plugin_change("插件安装完成")
+            return
+        # 批量安装，拿不到单一的包名，所以只给线索、不做一键修复
+        blocked = ignored_build_packages(self._last_cmd_output)
+        hint = ""
+        if blocked:
+            hint = ("\n\n⚠ 这些依赖的安装脚本被 pnpm 拦下了：" + "、".join(blocked) +
+                    "\n对应的插件会停在「已安装但未挂载」状态，"
+                    "请回到插件列表在红色分组里逐个点「修复」。")
+        messagebox.showerror(
+            "失败",
+            f"安装失败（退出码 {code}）。\n\n"
+            f"命令最后几行输出：\n{self._command_output_tail() or '（无）'}{hint}\n\n"
+            "完整输出见下方「运行日志」。",
+        )
         self.refresh_plugins()
 
     # ------------------------------------------------------------------ #

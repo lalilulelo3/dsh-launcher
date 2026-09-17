@@ -98,6 +98,46 @@ def dsh_cmd() -> str:
     return "dsh"
 
 
+def quote_arg(s: str) -> str:
+    """给命令参数加双引号（``_quote`` 的对外公开版本，供 launcher 拼接命令用）。"""
+    return _quote(s)
+
+
+def pnpm_cmd() -> str:
+    """返回调用 ``pnpm`` 的命令字符串（已带引号）。
+
+    与 ``dsh_cmd()`` 同理：从资源管理器双击启动的进程继承到的 PATH 未必完整，
+    所以优先找全局安装目录里的 ``pnpm.cmd`` 完整路径，再退回 PATH。
+    """
+    candidates = []
+    appdata = os.environ.get("APPDATA", "").strip()
+    if appdata:
+        candidates.append(Path(appdata) / "npm" / "pnpm.cmd")
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    if local:
+        # pnpm 独立安装包（pnpm.exe）的默认位置
+        candidates.append(Path(local) / "pnpm" / "pnpm.exe")
+    for candidate in candidates:
+        if candidate.is_file():
+            return _quote(str(candidate))
+    found = shutil.which("pnpm")
+    if found:
+        return _quote(found)
+    return "pnpm"
+
+
+def approve_builds_cmd() -> str:
+    """在 web 档案目录里放行「待审的构建脚本」（非交互）。
+
+    对应 ``pnpm approve-builds --all``：把 ``allowBuilds`` 写进档案目录的
+    ``pnpm-workspace.yaml``。插件带原生依赖（典型如 ``node-pty``）时，
+    pnpm 默认会拦截它的安装脚本并以非 0 退出——这会让 ``dsh plugin add``
+    半途而废：依赖已写进 ``package.json``、文件已进 ``node_modules``，
+    但插件层登记（``dsh.profile.bundles``）被跳过，表现为「装了但不生效」。
+    """
+    return f"cd /d {_quote(str(profile_dir()))} && {pnpm_cmd()} approve-builds --all"
+
+
 def child_env() -> dict:
     """构造给子进程用的环境变量。
 
@@ -229,20 +269,33 @@ def update_dsh(timeout: float = 300.0) -> bool:
         return False
 
 
-def dump_config(timeout: float = 90.0) -> str | None:
+def dump_config(timeout: float = 90.0) -> tuple[str | None, str | None]:
     """导出当前 web 档案“组合后”的插件树（不启动服务，只打印配置）。
 
     这是启动器最重要的诊断能力：即使某个插件坏到让 DSH 启动不起来，
     只要它的配置本身还能被解析，这个命令通常仍能给出完整的插件条目清单
-    （每个条目的 id、模块名、是否禁用）。失败返回 None。
+    （每个条目的 id、模块名、是否禁用）。
+
+    返回 ``(输出, 错误说明)``：成功时错误为 ``None``；失败时输出为 ``None``。
+    **务必区分这两者**——失败时如果只返回一个 ``None``，上层会把「解析失败」
+    和「确实没有任何条目」当成同一件事，于是所有插件开关全部静默失灵
+    （这正是真机上踩过的坑：``--dump-config`` 需要写 profile 目录下的
+    ``cordis.yml``，目录不可写时会 ``EPERM`` 退出 1）。
     """
     try:
         proc = run_command(f"{dsh_cmd()} web --dump-config", timeout=timeout)
-        if proc.returncode != 0:
-            return None
-        return proc.stdout or ""
-    except Exception:
-        return None
+    except subprocess.TimeoutExpired:
+        return None, f"命令超过 {timeout:.0f} 秒没有返回（可能被安全软件拦截或在等待交互）"
+    except Exception as exc:  # noqa: BLE001
+        return None, f"无法执行命令：{exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip() or (proc.stdout or "").strip()
+        tail = "\n".join(detail.splitlines()[-6:])
+        msg = f"dsh web --dump-config 退出码 {proc.returncode}"
+        if tail:
+            msg += "：" + tail
+        return None, msg
+    return proc.stdout or "", None
 
 
 def is_port_open(port: int = WEB_PORT, timeout: float = 1.0) -> bool:
