@@ -53,6 +53,7 @@ from plugins import (
     set_disabled_map,
     ignored_build_packages,
     bundles_list,
+    diagnose_boot_failure,
     Inventory,
 )
 from backup import (
@@ -327,8 +328,11 @@ class App:
         self.status_var.set(text)
 
     def _append_log(self, text: str) -> None:
+        # 每行前面加时间戳：事后排查时，没有时间戳就只能靠内容猜顺序
+        stamp = datetime.datetime.now().strftime("[%H:%M:%S] ")
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", text + "\n")
+        for line in str(text).split("\n"):
+            self.log_text.insert("end", stamp + line + "\n")
         self._trim_log_panel()
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
@@ -422,14 +426,17 @@ class App:
 
     def _on_log_line(self, line: str) -> None:
         # 运行在后台读线程里：只入队，不碰界面
-        self.log_tail.append(line)
-        self._post(("log", line))
-        # DSH 启动成功后会用这行打印“带 token 的认证地址”，
-        # 例如：dsh web: http://127.0.0.1:3080/?token=xxx
-        # 这才是浏览器真正要打开的地址（裸地址会被 401 拒绝）。
+        # 先做「就绪地址」匹配，再加时间戳——匹配用的是行首锚定，
+        # 加了前缀就匹配不上了。
         m = re.match(r"^dsh web:\s+(\S+)", line)
         if m and self._ready_url is None:
             self._ready_url = m.group(1)
+        # DSH 启动成功后会用这行打印“带 token 的认证地址”，
+        # 例如：dsh web: http://127.0.0.1:3080/?token=xxx
+        # 这才是浏览器真正要打开的地址（裸地址会被 401 拒绝）。
+        stamp = datetime.datetime.now().strftime("[%H:%M:%S] ")
+        self.log_tail.append(stamp + line)
+        self._post(("log", line))
 
     # ------------------------------------------------------------------ #
     # 版本检查与更新
@@ -1772,6 +1779,7 @@ class App:
         self._show_failed_dialog(None, msg)
 
     def _show_failed_dialog(self, code, detail: str) -> None:
+        diag = diagnose_boot_failure(detail)
         dlg = tk.Toplevel(self.root)
         dlg.title("启动失败")
         dlg.transient(self.root)
@@ -1782,8 +1790,24 @@ class App:
         if code is not None:
             head += f"（退出码 {code}）"
         ttk.Label(frm, text=head, font=("Microsoft YaHei UI", 11, "bold"), foreground="#c00").pack(anchor="w")
-        ttk.Label(frm, text="下方是错误信息。请在主窗口关闭可疑插件后，重新点击“启动 Harness”。",
-                  wraplength=460).pack(anchor="w", pady=(6, 8))
+
+        if diag:
+            # 认出已知故障时，先说人话：是什么、为什么、怎么办
+            self._append_log(f"[启动器] 启动失败诊断：{diag['title']}")
+            ttk.Label(frm, text="诊断：" + diag["title"],
+                      font=("Microsoft YaHei UI", 10, "bold"), foreground="#c0392b",
+                      wraplength=460, justify="left").pack(anchor="w", pady=(8, 2))
+            if diag.get("detail"):
+                ttk.Label(frm, text=diag["detail"], wraplength=460, justify="left").pack(anchor="w")
+            if diag.get("hint"):
+                ttk.Label(frm, text=diag["hint"], wraplength=460, justify="left",
+                          foreground="#b26a00").pack(anchor="w", pady=(6, 0))
+            ttk.Label(frm, text="下方是原始输出，可直接复制给别人看。",
+                      foreground="#888").pack(anchor="w", pady=(10, 4))
+        else:
+            ttk.Label(frm, text="下方是错误信息。请在主窗口关闭可疑插件后，重新点击“启动 Harness”。",
+                      wraplength=460).pack(anchor="w", pady=(6, 8))
+
         txt = scrolledtext.ScrolledText(frm, height=14, width=64, wrap="word")
         txt.insert("1.0", detail)
         txt.configure(state="disabled")
@@ -1807,6 +1831,14 @@ class App:
 
         if load_last_good():
             ttk.Button(row, text="恢复上次正常配置", command=do_restore).pack(side="left", padx=(8, 0))
+
+        if diag and diag.get("kind") == "module-export-mismatch":
+            def do_repair_dsh() -> None:
+                dlg.destroy()
+                self.on_install_dsh()      # 自带二次确认，不直接动手
+
+            ttk.Button(row, text="安装 / 修复 DSH…", command=do_repair_dsh).pack(side="left", padx=(8, 0))
+
         ttk.Button(row, text="知道了", command=dlg.destroy).pack(side="right")
 
     def _copy_to_clipboard(self, text: str) -> bool:

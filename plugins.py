@@ -156,10 +156,123 @@ def ignored_build_packages(output) -> list:
     names = []
     for m in _IGNORED_BUILDS_RE.finditer(text):
         for part in m.group(1).split(","):
-            part = part.strip().strip("'\"")
+            # pnpm 的「警告」形态（非致命）会在末尾带一个句号，去掉它
+            part = part.strip().strip("'\"").rstrip("。.")
             if part and part not in names:
                 names.append(part)
     return names
+
+
+# --------------------------------------------------------------------------- #
+# 启动失败诊断：从宿主输出里认出已知的致命故障
+# --------------------------------------------------------------------------- #
+
+_LOADER_ENTRY_RE = re.compile(r"failed to import loader entry (\S+) \(([^)]+)\)")
+_EXPORT_MISMATCH_RE = re.compile(
+    r"The requested module '([^']+)' does not provide an export named '([^']+)'"
+)
+_MODULE_NOT_FOUND_RE = re.compile(r"Cannot find (?:module|package) '([^']+)'")
+# 出问题的模块是从「档案目录」里加载的（而不是全局安装目录）——这本身就是一个诊断信号：
+# 档案里混进了 DSH 内部包的副本，版本和全局那份对不上。
+_PROFILE_COPY_RE = re.compile(
+    r"profiles[/\\][^/\\]+[/\\]node_modules[/\\]((?:@[^/\\]+[/\\])?[^/\\]+)"
+)
+
+
+def diagnose_boot_failure(output) -> dict | None:
+    """从 DSH 启动输出里认出已知的致命故障，返回一份结构化诊断。
+
+    识别不出（或输出为空）时返回 ``None``，交给调用方按原样展示日志。
+
+    目前认识三类，每一类都对应实测见过的故障：
+
+    - ``module-export-mismatch``：某个包要的导出，在另一个包里不存在
+      （``The requested module 'X' does not provide an export named 'Y'``）。
+      实测成因是**全局 DSH 装到一半**：外层 dsh 与它内部包的版本拼在一起了，
+      于是插件树加载失败、dsh 直接退出（表现为「启动器一启动就失败」）。
+    - ``module-not-found``：缺模块，多半是插件安装被中断。
+    - ``plugin-tree-load-failed``：只知道插件树挂了，用安全模式缩小范围。
+    """
+    text = "\n".join(output) if isinstance(output, (list, tuple)) else str(output or "")
+    if not text.strip():
+        return None
+
+    entries = _LOADER_ENTRY_RE.findall(text)
+    exports = _EXPORT_MISMATCH_RE.findall(text)
+    missing = _MODULE_NOT_FOUND_RE.findall(text)
+
+    if exports or (entries and "plugin tree failed to load" in text):
+        module, export = exports[0] if exports else ("", "")
+        entry, entry_pkg = entries[0] if entries else ("", "")
+        pkgs = []
+        for cand in (entry_pkg, module):
+            if cand and cand not in pkgs:
+                pkgs.append(cand)
+        shadowed = []
+        for cand in _PROFILE_COPY_RE.findall(text):
+            if cand not in shadowed:
+                shadowed.append(cand)
+        detail = []
+        if entry_pkg:
+            detail.append(f"出问题的插件条目：{entry}（来自 {entry_pkg}）")
+        if module and export:
+            detail.append(f"它要从 {module} 取一个叫 {export} 的导出，但装着的这一版里没有这个名字。")
+        if shadowed:
+            detail.append("而且它加载的是**档案目录**里的副本，不是全局那一份：")
+            detail.extend(f"    profiles/…/node_modules/{s}" for s in shadowed)
+        else:
+            detail.append("也就是说：这两个包的版本对不上，被拼在了一起。")
+        if shadowed:
+            hint = ("这类故障的典型成因：某个插件把 DSH 自己的内部包（@deepseek-ai/*）当依赖装进了档案，\n"
+                    "版本和全局 DSH 对不上，于是插件树加载失败、dsh 直接退出。\n"
+                    "处理顺序：\n"
+                    "  1. 到「工具」页点【安装 / 修复 DSH】，把全局那份补成一致版本；\n"
+                    "  2. 回插件列表，把最近装过的插件逐个「卸载…」（副本会随它一起被清掉）；\n"
+                    "  3. 想确认是谁引进来的，可在档案目录里跑：pnpm why <副本包名>。")
+        else:
+            hint = ("实测这类故障几乎都是「全局 DSH 装到一半 / 版本拼在一起」造成的：\n"
+                    "  1. 到「工具」页点【安装 / 修复 DSH】（即 npm install -g @deepseek-ai/dsh@latest）；\n"
+                    "  2. 若刚才是被某个插件拖坏的，用【安全模式启动】确认一次；\n"
+                    "  3. 仍不行就【导出诊断报告】，报告里已包含启动日志。")
+        return {
+            "kind": "module-export-mismatch",
+            "title": "插件树加载失败：模块版本对不上",
+            "detail": "\n".join(detail) or "有包在加载时找不到它期望的导出。",
+            "hint": hint,
+            "packages": pkgs + [s for s in shadowed if s not in pkgs],
+        }
+
+    if missing:
+        pkg = missing[0]
+        return {
+            "kind": "module-not-found",
+            "title": "插件树加载失败：缺少模块",
+            "detail": f"启动时找不到模块：{pkg}",
+            "hint": "多半是插件没装完（依赖缺失或被中断）。到「工具」页重跑一次插件安装；"
+                    "若列表里有红色的「已安装但未挂载」，对它点【修复】。",
+            "packages": [pkg],
+        }
+
+    if "plugin tree failed to load" in text:
+        return {
+            "kind": "plugin-tree-load-failed",
+            "title": "插件树加载失败",
+            "detail": "有插件在加载阶段就报错，导致整个插件树起不来（具体报错见下方原始输出）。",
+            "hint": "先用【安全模式启动】确认是不是第三方插件引起的，"
+                    "再回插件列表逐个关掉可疑插件重试。",
+            "packages": [],
+        }
+
+    if "pnpm failed in profile directory" in text or "ERR_PNPM" in text:
+        return {
+            "kind": "pnpm-failed",
+            "title": "档案依赖安装失败（pnpm）",
+            "detail": "dsh 在档案目录里跑 pnpm 时失败了，插件可能只装了一半。",
+            "hint": "若日志里是 Ignored build scripts，就到插件列表对红色的「已安装但未挂载」项点【修复】；"
+                    "否则看下方原始输出里 pnpm 的具体报错。",
+            "packages": [],
+        }
+    return None
 
 
 def _parse_dump(raw: str | None) -> list:
