@@ -15,3 +15,7 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 启动器导出的运行日志：里面含带 token 的本地地址，绝不入库
+dsh-launcher-log*.txt
+*-launcher-log*.txt
