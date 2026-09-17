@@ -69,12 +69,17 @@ from backup import (
 )
 
 # 启动器自身的版本号（发布 Release 时与 git tag 对应）
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 # 首次启动可能要走 npx 下载依赖，因此给足等待时间（秒）
 READY_TIMEOUT = 180
 # 日志面板保留的行数（也用于失败时展示错误摘要）
 LOG_TAIL = 80
+# 运行日志面板最多保留的行数：面板是一直累积的，长时间开着会无限吃内存，
+# 超出后从顶部丢弃。修剪时一次多丢一些，避免每来一行就修剪一次。
+# 注意：诊断报告与失败摘要用的是 LOG_TAIL 那个独立的小缓冲，不受这里影响。
+LOG_PANEL_MAX_LINES = 5000
+LOG_PANEL_TRIM_STEP = 500
 
 LINK_STYLE = {"foreground": "#2a7ae2", "cursor": "hand2"}
 
@@ -170,6 +175,8 @@ class App:
         log_head.pack(fill="x")
         ttk.Checkbutton(log_head, text="深色模式", variable=self.dark_var,
                         command=self.on_toggle_dark).pack(side="left")
+        ttk.Label(log_head, text=f"（面板只保留最近 {LOG_PANEL_MAX_LINES} 行，更早的会自动丢弃）",
+                  foreground="#888").pack(side="left", padx=(10, 0))
         ttk.Button(log_head, text="清空", command=self.on_clear_log).pack(side="right")
         ttk.Button(log_head, text="日志另存为…", command=self.on_save_log).pack(side="right", padx=(0, 6))
         self.log_text = scrolledtext.ScrolledText(log_frame, height=8, state="disabled", wrap="word")
@@ -322,8 +329,29 @@ class App:
     def _append_log(self, text: str) -> None:
         self.log_text.configure(state="normal")
         self.log_text.insert("end", text + "\n")
+        self._trim_log_panel()
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    def _trim_log_panel(self) -> None:
+        """把日志面板裁到上限以内（从顶部丢弃最旧的若干行）。
+
+        面板里的内容是一直累积的，长跑一天能上万行；不裁剪既吃内存，
+        也会让 Tk 的文本控件越来越慢。这里只在**超过上限**时修剪，
+        并且一次多丢一点（留出 LOG_PANEL_TRIM_STEP 的余量），
+        免得每追加一行都要删一次。
+        """
+        try:
+            lines = int(self.log_text.index("end-1c").split(".")[0])
+        except Exception:
+            return
+        if lines <= LOG_PANEL_MAX_LINES:
+            return
+        keep = max(1, LOG_PANEL_MAX_LINES - LOG_PANEL_TRIM_STEP)
+        try:
+            self.log_text.delete("1.0", f"{lines - keep + 1}.0")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # 线程安全：后台线程 -> 队列 -> 主线程
