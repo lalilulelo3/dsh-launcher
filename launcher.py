@@ -16,14 +16,17 @@ import datetime
 import json
 import queue
 import re
+import sys
 import threading
-import webbrowser
 import time
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 from tkinter import scrolledtext
 from pathlib import Path
 
+import theme
+from browser import AppWindow, endpoint_label
 from core import (
     WEB_URL,
     WEB_PORT,
@@ -70,7 +73,7 @@ from backup import (
 )
 
 # 启动器自身的版本号（发布 Release 时与 git tag 对应）
-__version__ = "1.0.3"
+__version__ = "1.1.0"
 
 # 首次启动可能要走 npx 下载依赖，因此给足等待时间（秒）
 READY_TIMEOUT = 180
@@ -82,7 +85,6 @@ LOG_TAIL = 80
 LOG_PANEL_MAX_LINES = 5000
 LOG_PANEL_TRIM_STEP = 500
 
-LINK_STYLE = {"foreground": "#2a7ae2", "cursor": "hand2"}
 
 
 def _fmt_time(iso: str) -> str:
@@ -114,17 +116,31 @@ def _save_ui_settings(data: dict) -> None:
         pass
 
 
-DARK_PALETTE = {"bg": "#1f1f1f", "fg": "#e6e6e6", "field": "#2b2b2b"}
-LIGHT_PALETTE = {"bg": "#f0f0f0", "fg": "#202020", "field": "#ffffff"}
+def _resource_path(*parts) -> Path:
+    """定位随程序一起分发的资源（图标等）。
+
+    打包成单文件 exe 后，程序自己会被解压到临时目录 ``sys._MEIPASS``，
+    资源在那里而不是源码旁边，所以两种情形都要照顾到。
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    root_dir = Path(base) if base else Path(__file__).resolve().parent
+    return root_dir.joinpath(*parts)
 
 
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.harness = HarnessProcess(log_callback=self._on_log_line)
+        # 「自动最大化」是后台线程做的，日志必须走队列回主线程再写控件
+        self.app_window = AppWindow(
+            log=lambda msg: self._post(("log", f"[启动器] {msg}"))
+        )
         self.ui_queue: queue.Queue = queue.Queue()
         self.log_tail: collections.deque = collections.deque(maxlen=LOG_TAIL)
         self.starting = False          # 是否正处于“启动→等待就绪”的过程
+        self.power_state = "idle"      # idle / starting / running / stopped / failed
+        self._dot_key = "muted"        # 状态灯当前用的调色板键
+        self._spin_angle = 0           # 启动时那个"转圈"的当前角度
         self.plugin_vars = {}          # 包名 -> BooleanVar（开关）
         self.plugin_entry_ids = {}     # 包名 -> 条目 id 列表（渲染时缓存，供开关使用）
         self._ready_url = None         # DSH 启动成功后打印的带 token 访问地址
@@ -132,11 +148,16 @@ class App:
         self._current_unmounted = []   # 最近一次渲染出来的“已安装但未挂载”列表
         self._last_cmd_output = []     # 最近一条后台命令的输出行（用于分析失败原因）
         self._bundles_before = []      # 命令执行前的插件层清单（用于判断“需要重启”）
+        self._last_inventory = None    # 最近一次插件清点结果（换主题时重画用，不重新读档案）
         self._restart_deadline = 0.0   # 自动重启时等待端口释放的截止时间
         self.ui_settings = _load_ui_settings()
         self.dark_mode = bool(self.ui_settings.get("dark", False))
+        # 打开方式：True = 独立应用窗口（可随启动器关闭）；False = 默认浏览器标签页
+        self.open_as_app = bool(self.ui_settings.get("open_as_app", True))
         self.dark_var = tk.BooleanVar(value=self.dark_mode)
+        self.status_var = tk.StringVar(value="就绪")
 
+        self.palette = theme.palette(self.dark_mode)
         self._build_ui()
         saved_geometry = self.ui_settings.get("geometry")
         if isinstance(saved_geometry, str) and saved_geometry:
@@ -155,155 +176,195 @@ class App:
     # ------------------------------------------------------------------ #
     # 界面构建
     # ------------------------------------------------------------------ #
+    def _set_window_icon(self) -> None:
+        """设置窗口 / 任务栏图标（没有图标文件时安静跳过，不影响使用）。"""
+        ico = _resource_path("assets", "launcher.ico")
+        if ico.is_file():
+            try:
+                # default= 让之后新建的 Toplevel（各种对话框）也带上同一个图标
+                self.root.iconbitmap(default=str(ico))
+                return
+            except Exception:
+                pass
+        png = _resource_path("assets", "launcher-256.png")
+        if png.is_file():
+            try:
+                self._icon_image = tk.PhotoImage(file=str(png))
+                self.root.iconphoto(True, self._icon_image)
+            except Exception:
+                pass
+
     def _build_ui(self) -> None:
         self.root.title(f"DeepSeek Harness 启动器  v{__version__}")
-        self.root.geometry("840x720")
-        self.root.minsize(720, 600)
+        self.root.geometry("920x800")
+        self.root.minsize(800, 680)
+        self._set_window_icon()
 
-        # —— 主体：三个选项卡，按钮按职责分组，不再堆在一起 ——
+        # —— 主体：两个选项卡（原来的三个太碎，插件安装被隔到了别的页）——
         nb = ttk.Notebook(self.root)
-        nb.pack(fill="both", expand=True, padx=10, pady=(10, 6))
+        nb.pack(fill="both", expand=True, padx=12, pady=(10, 6))
+        self.nb = nb
         self._build_home_tab(nb)
-        self._build_backup_tab(nb)
-        self._build_tools_tab(nb)
+        self._build_maintain_tab(nb)
 
-        # —— 底部：状态栏 + 运行日志（无论切到哪个选项卡都看得到）——
-        self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(self.root, textvariable=self.status_var, padding=(12, 3)).pack(fill="x")
-        log_frame = ttk.LabelFrame(self.root, text="运行日志", padding=6)
-        log_frame.pack(fill="both", padx=10, pady=(0, 10))
+        # —— 底部：状态栏 + 运行日志（切到哪个选项卡都看得到）——
+        bar = ttk.Frame(self.root, style="Window.TFrame")
+        bar.pack(fill="x", padx=14, pady=(0, 6))
+        # 状态灯：平时是实心圆点，启动过程中变成转圈的弧（见 _draw_status_dot）
+        self._status_dot = tk.Canvas(bar, width=16, height=16, highlightthickness=0, bd=0)
+        self._status_dot.pack(side="left", pady=(1, 0))
+        self._dot_id = self._status_dot.create_oval(2, 2, 14, 14, outline="", fill="#9AA1AC")
+        ttk.Label(bar, textvariable=self.status_var, style="Window.TLabel").pack(
+            side="left", padx=(8, 0))
+
+        log_frame = ttk.LabelFrame(self.root, text="运行日志", padding=(10, 6))
+        log_frame.pack(fill="both", padx=12, pady=(0, 12))
         log_head = ttk.Frame(log_frame)
         log_head.pack(fill="x")
         ttk.Checkbutton(log_head, text="深色模式", variable=self.dark_var,
                         command=self.on_toggle_dark).pack(side="left")
-        ttk.Label(log_head, text=f"（面板只保留最近 {LOG_PANEL_MAX_LINES} 行，更早的会自动丢弃）",
-                  foreground="#888").pack(side="left", padx=(10, 0))
-        ttk.Button(log_head, text="清空", command=self.on_clear_log).pack(side="right")
-        ttk.Button(log_head, text="日志另存为…", command=self.on_save_log).pack(side="right", padx=(0, 6))
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, state="disabled", wrap="word")
-        self.log_text.pack(fill="both", expand=True)
+        ttk.Label(log_head, text=f"只保留最近 {LOG_PANEL_MAX_LINES} 行，"
+                                 "要留档请先「日志另存为…」",
+                  style="Muted.TLabel").pack(side="left", padx=(12, 0))
+        ttk.Button(log_head, text="清空", style="Mini.TButton",
+                   command=self.on_clear_log).pack(side="right")
+        ttk.Button(log_head, text="日志另存为…", style="Mini.TButton",
+                   command=self.on_save_log).pack(side="right", padx=(0, 6))
+        self.log_text = scrolledtext.ScrolledText(
+            log_frame, height=9, state="disabled", wrap="word",
+            font=(theme.FONT_MONO, 9), relief="flat", bd=0,
+        )
+        self.log_text.pack(fill="both", expand=True, pady=(6, 0))
 
-    # —— 选项卡一：主页（版本 / 启动 / 插件）——
+    # —— 选项卡一：主页（状态 + 启动控制 + 插件管理）——
     def _build_home_tab(self, nb) -> None:
-        tab = ttk.Frame(nb, padding=12)
-        nb.add(tab, text="  主页  ")
+        page = ttk.Frame(nb, style="Window.TFrame", padding=(4, 10, 4, 4))
+        nb.add(page, text="  主页  ")
 
-        ver = ttk.LabelFrame(tab, text="DSH 版本", padding=(10, 6))
-        ver.pack(fill="x")
-        self.lbl_installed = ttk.Label(ver, text="本机版本：检测中…",
-                                       font=("Microsoft YaHei UI", 10, "bold"))
+        card = ttk.LabelFrame(page, text="Harness", padding=(12, 10))
+        card.pack(fill="x")
+        top = ttk.Frame(card)
+        top.pack(fill="x")
+        self.lbl_installed = ttk.Label(top, text="本机版本：检测中…", style="Section.TLabel")
         self.lbl_installed.pack(side="left")
-        self.lbl_latest = ttk.Label(ver, text="最新版本：检测中…")
-        self.lbl_latest.pack(side="left", padx=(18, 0))
-        ttk.Button(ver, text="检查更新", command=self.manual_check_update).pack(side="right")
+        self.lbl_latest = ttk.Label(top, text="最新版本：检测中…", style="Muted.TLabel")
+        self.lbl_latest.pack(side="left", padx=(14, 0), pady=(4, 0))
+        ttk.Button(top, text="检查更新", style="Mini.TButton",
+                   command=self.manual_check_update).pack(side="right")
 
-        act = ttk.Frame(tab)
-        act.pack(fill="x", pady=(12, 6))
-        self.btn_launch = ttk.Button(act, text="启动 Harness", command=self.on_launch)
-        self.btn_launch.pack(side="left", ipadx=10, ipady=2)
-        self.btn_stop = ttk.Button(act, text="停止", command=self.on_stop, state="disabled")
-        self.btn_stop.pack(side="left", padx=(8, 0))
-        ttk.Button(act, text="打开界面", command=self.open_browser).pack(side="left", padx=(8, 0))
-        ttk.Button(act, text="安全模式启动", command=self.on_safe_mode_launch).pack(side="left", padx=(8, 0))
-        ttk.Label(tab, text="「安全模式启动」＝ 本次启动临时禁用全部第三方插件，"
-                            "用来判断问题是不是插件引起的（不会改动你的开关设置）。",
-                  foreground="#666", wraplength=780, justify="left").pack(anchor="w", pady=(0, 8))
+        act = ttk.Frame(card)
+        act.pack(fill="x", pady=(12, 0))
+        # 主按钮是三态的：启动 → 停止 → 恢复
+        # 「停止」只停服务、浏览器窗口留着；停下之后按钮变成「恢复」。
+        self.btn_power = ttk.Button(act, text="启动 Harness", style="Accent.TButton",
+                                    command=self.on_power)
+        self.btn_power.pack(side="left")
+        self.btn_restart = ttk.Button(act, text="重启", style="Mini.TButton",
+                                      command=self.on_restart, state="disabled")
+        self.btn_restart.pack(side="left", padx=(8, 0))
+        ttk.Button(act, text="打开界面", style="Mini.TButton",
+                   command=self.open_browser).pack(side="left", padx=(8, 0))
+        ttk.Button(act, text="安全模式启动", style="Mini.TButton",
+                   command=self.on_safe_mode_launch).pack(side="left", padx=(8, 0))
 
-        box = ttk.LabelFrame(tab, text="已安装插件（勾选 = 启用）", padding=8)
-        box.pack(fill="both", expand=True)
+        # 打开方式让用户自己选：独立窗口（启动器管得住、可随启动器关闭）
+        # 还是默认浏览器的普通标签页（和平时上网一致，但启动器关不掉它）
+        mode_row = ttk.Frame(card)
+        mode_row.pack(fill="x", pady=(10, 0))
+        self.open_mode_var = tk.BooleanVar(value=self.open_as_app)
+        ttk.Checkbutton(mode_row, text="用独立窗口打开",
+                        variable=self.open_mode_var,
+                        command=self.on_open_mode_changed).pack(side="left")
+        ttk.Label(mode_row, text="（勾选＝独立窗口，可随启动器一起关闭；"
+                                 "取消＝默认浏览器的普通标签页，启动器关不掉它）",
+                  style="Muted.TLabel").pack(side="left", padx=(8, 0))
+
+        ttk.Label(card,
+                  text="「停止」＝ 只停服务，浏览器窗口留着（按钮会变成「恢复」）；"
+                       "「重启」＝ 停掉再启动，改完插件用它。\n"
+                       "「安全模式启动」＝ 本次临时禁用全部第三方插件，"
+                       "用来判断问题是不是插件引起的（不会改动你的开关设置）。",
+                  style="Muted.TLabel", wraplength=830, justify="left").pack(anchor="w", pady=(10, 0))
+
+        box = ttk.LabelFrame(page, text="插件", padding=(12, 10))
+        box.pack(fill="both", expand=True, pady=(12, 0))
 
         head = ttk.Frame(box)
-        head.pack(fill="x", pady=(0, 6))
-        ttk.Label(head, text="点右侧「版本…」可查看全部版本、升级或回退",
-                  foreground="#666").pack(side="left")
-        ttk.Button(head, text="刷新", command=self.refresh_plugins).pack(side="right")
-        ttk.Button(head, text="检查全部更新", command=self.on_check_all_updates).pack(side="right", padx=(0, 6))
+        head.pack(fill="x")
+        ttk.Button(head, text="安装插件…", command=self.on_install_plugin).pack(side="left")
+        ttk.Button(head, text="检查全部更新", command=self.on_check_all_updates).pack(side="left", padx=(8, 0))
+        ttk.Button(head, text="刷新", command=self.refresh_plugins).pack(side="left", padx=(8, 0))
+        ttk.Button(head, text="导入并重装…", style="Mini.TButton",
+                   command=self.on_import_plugin_list).pack(side="right")
+        ttk.Button(head, text="导出清单…", style="Mini.TButton",
+                   command=self.on_export_plugin_list).pack(side="right", padx=(0, 8))
+        ttk.Label(box, text="勾选 = 启用；点「版本…」可看全部版本，升级或回退都行。"
+                            "安装、更新、清单导入导出都在这一页，装完直接出现在下方。",
+                  style="Muted.TLabel", wraplength=830, justify="left").pack(anchor="w", pady=(8, 8))
 
-        canvas = tk.Canvas(box, highlightthickness=0)
+        listwrap = ttk.Frame(box)
+        listwrap.pack(fill="both", expand=True)
+        canvas = tk.Canvas(listwrap, highlightthickness=0, bd=0)
         self._plugin_canvas = canvas
         # Canvas 不会自动处理鼠标滚轮，必须显式绑定（见 _on_plugin_wheel）
         canvas.bind("<MouseWheel>", self._on_plugin_wheel)
-        scrollbar = ttk.Scrollbar(box, orient="vertical", command=canvas.yview)
+        scrollbar = ttk.Scrollbar(listwrap, orient="vertical", command=canvas.yview)
         self.plugin_frame = ttk.Frame(canvas)
         self.plugin_frame.bind(
             "<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
         )
-        canvas.create_window((0, 0), window=self.plugin_frame, anchor="nw")
+        self._plugin_window = canvas.create_window((0, 0), window=self.plugin_frame, anchor="nw")
+        # 让内层跟着画布一起变宽，插件行才会铺满而不是挤在左边
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(self._plugin_window, width=e.width))
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-    # —— 选项卡二：备份与恢复 ——
-    def _build_backup_tab(self, nb) -> None:
-        tab = ttk.Frame(nb, padding=12)
-        nb.add(tab, text="  备份与恢复  ")
+    # —— 选项卡二：维护（备份 / 恢复 / 诊断 / 工具）——
+    def _build_maintain_tab(self, nb) -> None:
+        page = ttk.Frame(nb, style="Window.TFrame", padding=(4, 10, 4, 4))
+        nb.add(page, text="  维护  ")
 
-        b1 = ttk.LabelFrame(tab, text="档案", padding=10)
+        b1 = ttk.LabelFrame(page, text="备份与恢复", padding=(12, 10))
         b1.pack(fill="x")
-        ttk.Label(b1, text="重置前会自动备份；恢复前也会自动备份当前状态，随时可回退。",
-                  foreground="#666").pack(anchor="w", pady=(0, 8))
         row1 = ttk.Frame(b1)
         row1.pack(fill="x")
         ttk.Button(row1, text="立即备份…", command=self.on_manual_backup).pack(side="left")
         ttk.Button(row1, text="恢复备份…", command=self.on_restore_backup).pack(side="left", padx=(8, 0))
         ttk.Button(row1, text="重置档案…", command=self.on_reset_profile).pack(side="left", padx=(8, 0))
+        ttk.Label(b1, text="重置前会自动备份；恢复前也会自动备份当前状态，随时可回退。",
+                  style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
 
-        b2 = ttk.LabelFrame(tab, text="插件清单", padding=10)
-        b2.pack(fill="x", pady=(10, 0))
-        ttk.Label(b2, text="导出当前插件清单；以后可一键导入并按清单重装。",
-                  foreground="#666").pack(anchor="w", pady=(0, 8))
-        row2 = ttk.Frame(b2)
-        row2.pack(fill="x")
-        ttk.Button(row2, text="导出清单…", command=self.on_export_plugin_list).pack(side="left")
-        ttk.Button(row2, text="导入并重装…", command=self.on_import_plugin_list).pack(side="left", padx=(8, 0))
-
-        b3 = ttk.LabelFrame(tab, text="已有备份", padding=10)
-        b3.pack(fill="both", expand=True, pady=(10, 0))
-        self.backup_list = tk.Listbox(b3, height=8)
-        sb = ttk.Scrollbar(b3, orient="vertical", command=self.backup_list.yview)
+        b2 = ttk.LabelFrame(page, text="已有备份", padding=(12, 10))
+        b2.pack(fill="both", expand=True, pady=(12, 0))
+        listwrap = ttk.Frame(b2)
+        listwrap.pack(fill="both", expand=True)
+        self.backup_list = tk.Listbox(listwrap, height=7, relief="flat", bd=0,
+                                      activestyle="none", highlightthickness=0)
+        sb = ttk.Scrollbar(listwrap, orient="vertical", command=self.backup_list.yview)
         self.backup_list.configure(yscrollcommand=sb.set)
         self.backup_list.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        row3 = ttk.Frame(tab)
-        row3.pack(fill="x", pady=(6, 0))
-        ttk.Button(row3, text="刷新备份列表", command=self.refresh_backup_list).pack(side="right")
+        ttk.Button(b2, text="刷新备份列表", style="Mini.TButton",
+                   command=self.refresh_backup_list).pack(anchor="e", pady=(8, 0))
         self.refresh_backup_list()
 
-    # —— 选项卡三：工具 ——
-    def _build_tools_tab(self, nb) -> None:
-        tab = ttk.Frame(nb, padding=12)
-        nb.add(tab, text="  工具  ")
-
-        b1 = ttk.LabelFrame(tab, text="DSH 本体", padding=10)
-        b1.pack(fill="x")
-        row1 = ttk.Frame(b1)
-        row1.pack(fill="x")
-        ttk.Button(row1, text="安装 / 修复 DSH", command=self.on_install_dsh).pack(side="left")
-        ttk.Button(row1, text="手动启动（命令行）", command=self.on_manual_launch).pack(side="left", padx=(8, 0))
-        ttk.Label(b1, text="「安装 / 修复」重装 DSH 程序本身；「手动启动」在启动器出问题时"
-                           "新开命令行窗口启动。",
-                  foreground="#666", wraplength=680, justify="left").pack(anchor="w", pady=(8, 0))
-
-        b2 = ttk.LabelFrame(tab, text="插件", padding=10)
-        b2.pack(fill="x", pady=(10, 0))
-        row2 = ttk.Frame(b2)
-        row2.pack(fill="x")
-        ttk.Button(row2, text="安装插件…", command=self.on_install_plugin).pack(side="left")
-
-        b3 = ttk.LabelFrame(tab, text="高级", padding=10)
-        b3.pack(fill="x", pady=(10, 0))
+        b3 = ttk.LabelFrame(page, text="诊断与工具", padding=(12, 10))
+        b3.pack(fill="x", pady=(12, 0))
         row3 = ttk.Frame(b3)
         row3.pack(fill="x")
-        ttk.Button(row3, text="运行命令…", command=self.on_run_command).pack(side="left")
-        ttk.Button(row3, text="导出诊断报告…", command=self.on_export_diagnostics).pack(side="left", padx=(8, 0))
-        ttk.Label(b3, text="「导出诊断报告」会把版本、路径、插件清单和最近日志写成一个 txt，"
-                           "方便你在求助时直接发给别人。",
-                  foreground="#666", wraplength=680, justify="left").pack(anchor="w", pady=(8, 0))
-
-        b4 = ttk.LabelFrame(tab, text="环境信息", padding=10)
-        b4.pack(fill="both", expand=True, pady=(10, 0))
-        self.env_text = tk.Text(b4, height=6, wrap="word", relief="flat")
+        ttk.Button(row3, text="导出诊断报告…", command=self.on_export_diagnostics).pack(side="left")
+        ttk.Button(row3, text="运行命令…", command=self.on_run_command).pack(side="left", padx=(8, 0))
+        ttk.Button(row3, text="安装 / 修复 DSH", command=self.on_install_dsh).pack(side="left", padx=(8, 0))
+        ttk.Button(row3, text="手动启动（命令行）", style="Mini.TButton",
+                   command=self.on_manual_launch).pack(side="left", padx=(8, 0))
+        ttk.Label(b3, text="「导出诊断报告」把版本、路径、插件清单和最近日志写成一个 txt，"
+                           "求助时可直接发给别人；「安装 / 修复 DSH」重装 DSH 程序本身。",
+                  style="Muted.TLabel", wraplength=830, justify="left").pack(anchor="w", pady=(8, 8))
+        self.env_text = tk.Text(b3, height=5, wrap="word", relief="flat", bd=0,
+                                font=(theme.FONT_MONO, 9))
         self.env_text.pack(fill="both", expand=True)
         self.env_text.insert("1.0", "\n".join([
             f"DSH 家目录：{dsh_home()}",
@@ -471,6 +532,7 @@ class App:
 
     def _show_update_dialog(self, installed, latest) -> None:
         dlg = tk.Toplevel(self.root)
+        theme.paint_dialog(dlg, self.palette)
         dlg.title("发现新版本")
         dlg.resizable(False, False)
         dlg.transient(self.root)
@@ -527,14 +589,16 @@ class App:
 
     def _render_plugins(self, inv) -> None:
         self._clear_plugin_frame()
+        self._last_inventory = inv
         plugins = list(inv.plugins)
         unmounted = list(inv.unmounted)
         libraries = list(inv.libraries)
         self._current_plugins = plugins
         self._current_unmounted = unmounted
         if not plugins and not unmounted and not libraries:
-            ttk.Label(self.plugin_frame, text="暂未安装任何插件。\n可以在「工具」选项卡里安装插件，装好后点「刷新」。",
-                      foreground="#888").pack(anchor="w", pady=10)
+            ttk.Label(self.plugin_frame,
+                      text="暂未安装任何插件。\n可以在上面的「安装插件…」里装，装好后点「刷新」。",
+                      style="Muted.TLabel").pack(anchor="w", pady=10)
         # --dump-config 失败 ⇒ 所有条目 id 为空 ⇒ 开关会静默失灵。
         # 这种情况必须显性告警，绝不能和「确实没有条目」长得一样。
         if inv.dump_error:
@@ -543,37 +607,40 @@ class App:
             ttk.Label(
                 warn,
                 text="⚠ 无法解析插件条目，下面的「开关」暂时不可用。",
-                font=("Microsoft YaHei UI", 10, "bold"), foreground="#c0392b",
+                font=("Microsoft YaHei UI", 10, "bold"), style="Danger.TLabel",
             ).pack(anchor="w")
             ttk.Label(
                 warn,
                 text=f"原因：{inv.dump_error}\n"
                      "常见于档案目录不可写（权限、只读、被安全软件或其它进程占用）。\n"
                      "排查后可点「刷新」重试；详细输出见下方运行日志。",
-                foreground="#b26a00", justify="left", wraplength=760,
+                style="Warn.TLabel", justify="left", wraplength=760,
             ).pack(anchor="w")
             self._append_log(f"[启动器] 警告：导出插件条目失败 —— {inv.dump_error}")
         self.plugin_entry_ids = {p.name: p.entry_ids for p in plugins}
-        for p in plugins:
+        for index, p in enumerate(plugins):
+            if index:
+                # 行与行之间加一条极淡的分隔线，列表才不像一坨
+                ttk.Separator(self.plugin_frame, orient="horizontal").pack(fill="x")
             self._render_plugin_row(p)
         if unmounted:
             ttk.Separator(self.plugin_frame, orient="horizontal").pack(fill="x", pady=8)
             ttk.Label(
                 self.plugin_frame,
                 text="⚠ 已安装但未挂载（声明了插件层却没登记，因此不会生效）：",
-                font=("Microsoft YaHei UI", 10, "bold"), foreground="#c0392b",
+                font=("Microsoft YaHei UI", 10, "bold"), style="Danger.TLabel",
             ).pack(anchor="w")
             ttk.Label(
                 self.plugin_frame,
                 text="点右边的「修复」即可：放行被拦下的构建脚本，再重新登记一次。",
-                foreground="#b26a00",
+                style="Warn.TLabel",
             ).pack(anchor="w")
             for p in unmounted:
                 self._render_unmounted_row(p)
         if libraries:
             ttk.Separator(self.plugin_frame, orient="horizontal").pack(fill="x", pady=8)
             ttk.Label(self.plugin_frame, text="库依赖（非插件层，不影响启动，不可开关）：",
-                      foreground="#888").pack(anchor="w")
+                      style="Muted.TLabel").pack(anchor="w")
             for p in libraries:
                 self._render_library_row(p)
         # 行内子控件会"吃掉"滚轮事件，所以要给它们逐个补绑
@@ -634,18 +701,18 @@ class App:
         info.pack(side="left", fill="x", expand=True, padx=(6, 0))
         ttk.Label(info, text=f"{p.name}   v{p.version}", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
         if p.description:
-            ttk.Label(info, text=p.description, wraplength=540, foreground="#444").pack(anchor="w")
+            ttk.Label(info, text=p.description, wraplength=540, style="Desc.TLabel").pack(anchor="w")
         if p.homepage:
-            link = ttk.Label(info, text="项目主页 ↗", **LINK_STYLE)
+            link = ttk.Label(info, text="项目主页 ↗", style="Link.TLabel", cursor="hand2")
             link.pack(anchor="w")
             link.bind("<Button-1>", lambda e, url=p.homepage: webbrowser.open(url))
         if not p.entry_ids:
             ttk.Label(info, text="⚠ 未能定位该插件的启动条目，可能无法正常开关（请先“刷新列表”）",
-                      foreground="#b26a00").pack(anchor="w")
+                      style="Warn.TLabel").pack(anchor="w")
 
     def _render_library_row(self, p) -> None:
         ttk.Label(self.plugin_frame, text=f"• {p.name}  v{p.version}",
-                  foreground="#999", padding=(20, 1)).pack(anchor="w")
+                  style="Muted.TLabel", padding=(20, 1)).pack(anchor="w")
 
     def _render_unmounted_row(self, p) -> None:
         """渲染一个「已安装但未挂载」的插件：只给「修复」和「卸载」。"""
@@ -665,17 +732,17 @@ class App:
         info = ttk.Frame(row)
         info.pack(side="left", fill="x", expand=True)
         ttk.Label(info, text=f"{p.name}   v{p.version}",
-                  font=("Microsoft YaHei UI", 10, "bold"), foreground="#c0392b").pack(anchor="w")
+                  font=("Microsoft YaHei UI", 10, "bold"), style="Danger.TLabel").pack(anchor="w")
         ttk.Label(
             info,
             text="它自己声明了插件层，但没有出现在档案的插件层清单里，"
                  "所以 Harness 根本不会加载它（装了也不生效）。",
-            wraplength=540, foreground="#b26a00", justify="left",
+            wraplength=540, style="Warn.TLabel", justify="left",
         ).pack(anchor="w")
         if p.description:
-            ttk.Label(info, text=p.description, wraplength=540, foreground="#444").pack(anchor="w")
+            ttk.Label(info, text=p.description, wraplength=540, style="Desc.TLabel").pack(anchor="w")
         if p.homepage:
-            link = ttk.Label(info, text="项目主页 ↗", **LINK_STYLE)
+            link = ttk.Label(info, text="项目主页 ↗", style="Link.TLabel", cursor="hand2")
             link.pack(anchor="w")
             link.bind("<Button-1>", lambda e, url=p.homepage: webbrowser.open(url))
 
@@ -773,6 +840,7 @@ class App:
         """弹出版本选择框：列出可用版本，让用户挑一个安装。"""
         newest = versions[0][0]
         dlg = tk.Toplevel(self.root)
+        theme.paint_dialog(dlg, self.palette)
         dlg.title("插件版本")
         dlg.transient(self.root)
         dlg.grab_set()
@@ -783,10 +851,10 @@ class App:
         ttk.Label(frm, text=f"当前版本：{current}        最新版本：{newest}").pack(anchor="w", pady=(4, 4))
         if newest == current:
             ttk.Label(frm, text="当前已是最新版本。你仍然可以选择下面的任意版本进行「回退」。",
-                      foreground="#1a7f37").pack(anchor="w", pady=(0, 8))
+                      style="Ok.TLabel").pack(anchor="w", pady=(0, 8))
         else:
             ttk.Label(frm, text=f"有新版本可用：{newest}",
-                      foreground="#1a7f37").pack(anchor="w", pady=(0, 8))
+                      style="Ok.TLabel").pack(anchor="w", pady=(0, 8))
 
         tree = ttk.Treeview(frm, columns=("version", "time", "note"),
                             show="headings", height=10, selectmode="browse")
@@ -817,7 +885,7 @@ class App:
             text="说明：pnpm 默认会跳过发布时间不满 24 小时的版本（供应链保护）。\n"
                  "这里用「显式版本号」安装，选中哪一版就装哪一版，升级、回退都不受该限制。\n"
                  "更新插件会改动 Harness 正在使用的文件，建议先停止 Harness。",
-            foreground="#b26a00", justify="left",
+            style="Warn.TLabel", justify="left",
         ).pack(anchor="w", pady=(8, 6))
 
         row = ttk.Frame(frm)
@@ -1109,10 +1177,14 @@ class App:
             self.refresh_plugins()
 
     def _restart_dsh(self) -> None:
-        """停止后重新启动 Harness（用于「插件层变了，必须重启」）。"""
-        self._append_log("[启动器] 正在重启 Harness 以加载新的插件层 …")
+        """停掉再启动（「重启」按钮，以及插件层变动后的自动重启）。
+
+        停下时不保留旧浏览器窗口——重启后 token 会变，旧页面已经失效；
+        启动成功时会自动换成新页面。
+        """
+        self._append_log("[启动器] 正在重启 Harness …")
         try:
-            self.on_stop()
+            self.on_stop()          # manual=False：不保留旧窗口
         except Exception:
             pass
         self._restart_deadline = time.time() + 30
@@ -1157,41 +1229,134 @@ class App:
     # 外观 / 日志 / 诊断报告
     # ------------------------------------------------------------------ #
     def _apply_theme(self, dark: bool) -> None:
-        """切换浅色 / 深色外观（含输入框、列表等非 ttk 控件）。"""
+        """切换浅色 / 深色外观。
+
+        样式全部交给 ``theme`` 模块（ttk 的每个样式类都显式配置，不留系统默认），
+        这里只负责把那些**不吃 ttk 样式**的原生控件逐个上色。
+        """
         self.dark_mode = bool(dark)
-        palette = DARK_PALETTE if self.dark_mode else LIGHT_PALETTE
-        bg, fg, field = palette["bg"], palette["fg"], palette["field"]
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")     # 只有 clam 主题允许自由改色
-        except Exception:
-            pass
-        try:
-            style.configure(".", background=bg, foreground=fg, fieldbackground=field)
-            for name in ("TFrame", "TLabel", "TLabelframe", "TLabelframe.Label",
-                         "TCheckbutton", "TRadiobutton", "TNotebook"):
-                style.configure(name, background=bg, foreground=fg)
-            style.configure("TButton", background=field, foreground=fg)
-            style.configure("TNotebook.Tab", background=field, foreground=fg)
-            style.map("TNotebook.Tab", background=[("selected", bg)])
-        except Exception:
-            pass
-        self.root.configure(background=bg)
-        for widget in (getattr(self, "log_text", None),
-                       getattr(self, "backup_list", None),
-                       getattr(self, "env_text", None),
-                       getattr(self, "_plugin_canvas", None)):
-            if widget is None:
-                continue
-            try:
-                widget.configure(background=field, foreground=fg, insertbackground=fg)
-            except Exception:
-                pass
+        self.palette = theme.apply(self.root, self.dark_mode)
+        p = self.palette
+        for widget, is_field in (
+            (getattr(self, "log_text", None), True),
+            (getattr(self, "backup_list", None), True),
+            (getattr(self, "env_text", None), True),
+            (getattr(self, "_plugin_canvas", None), False),
+            (getattr(self, "_status_dot", None), False),
+        ):
+            theme.paint(widget, p, field=is_field)
+        self._draw_status_dot()
 
     def on_toggle_dark(self) -> None:
         self._apply_theme(self.dark_var.get())
         self.ui_settings["dark"] = self.dark_mode
         _save_ui_settings(self.ui_settings)
+        # 插件行是渲染时定色的，换主题要重画一次（用缓存，不重新读档案）
+        if self._last_inventory is not None:
+            try:
+                self._render_plugins(self._last_inventory)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ #
+    # 状态灯与主按钮（启动 / 停止 / 恢复 三态）
+    # ------------------------------------------------------------------ #
+    _DOT_KEYS = {
+        "idle": "muted",
+        "starting": "warn",
+        "running": "ok",
+        "stopped": "muted",
+        "failed": "danger",
+    }
+
+    @property
+    def _spinning(self) -> bool:
+        """是否处在"正在启动"（该转圈）的状态。
+
+        这里用两个信号**任一**成立来判断：``power_state`` 与 ``starting``。
+        正常情况下它们一致，但如果哪天只更新了其中一个，也不会出现
+        "状态说在启动、灯却不转"这种看着像卡死的假象。
+        """
+        return self.power_state == "starting" or bool(self.starting)
+
+    def _draw_status_dot(self) -> None:
+        """状态灯：平时是实心圆点；**启动过程中变成一个转圈的弧**。
+
+        用转圈代替"已等待 N 秒"：等待是连续的过程，动画比数字更直观，
+        也不会让人盯着数字越看越焦虑。
+        """
+        canvas = self._status_dot
+        try:
+            canvas.delete("all")
+        except Exception:
+            return
+        if self._spinning:
+            # 这一笔由 _animate_spinner 不断更新角度
+            try:
+                canvas.create_arc(2, 2, 14, 14, start=self._spin_angle, extent=270,
+                                  style="arc", outline=self.palette["accent"],
+                                  width=3, tags="spin")
+            except Exception:
+                pass
+            return
+        color = self.palette.get(self._dot_key, self.palette["muted"])
+        try:
+            self._dot_id = canvas.create_oval(2, 2, 14, 14, outline="", fill=color)
+        except Exception:
+            pass
+
+    def _set_status_dot(self, key: str) -> None:
+        self._dot_key = key
+        self._draw_status_dot()
+
+    def _set_power_state(self, mode: str) -> None:
+        """统一管理主按钮与「重启」按钮。
+
+        - ``idle``     未运行         → 「启动 Harness」（实心强调蓝，最抢眼）
+        - ``starting`` 正在启动       → 「停止」（浅红底红字，可中断）
+        - ``running``  运行中         → 「停止」（浅红底红字），「重启」可用
+        - ``stopped``  被手动停止     → 「恢复」（浅绿底绿字）：临时停一下就点它回来
+        - ``failed``   启动失败       → 「启动 Harness」
+        """
+        self.power_state = mode
+        if mode in ("running", "starting"):
+            text, style, state = "停止", "Stop.TButton", "normal"
+        elif mode == "stopped":
+            text, style, state = "恢复", "Resume.TButton", "normal"
+        else:
+            text, style, state = "启动 Harness", "Accent.TButton", "normal"
+        restart_state = "normal" if mode == "running" else "disabled"
+        try:
+            self.btn_power.configure(text=text, style=style, state=state)
+        except Exception:
+            pass
+        try:
+            self.btn_restart.configure(state=restart_state)
+        except Exception:
+            pass
+        self._set_status_dot(self._DOT_KEYS.get(mode, "muted"))
+
+    def on_power(self) -> None:
+        """主按钮：按当前状态决定是启动、停止还是恢复。"""
+        if self.power_state == "starting":
+            self.on_stop(manual=True)
+        elif self.power_state == "running":
+            self.on_stop(manual=True)
+        else:
+            self.on_launch()
+
+    def on_restart(self) -> None:
+        """重启：停掉再启动（改完插件 / 想彻底重来一次时用）。"""
+        if not dsh_available():
+            messagebox.showerror("未检测到 dsh", "未检测到可用的全局 dsh 命令，无法重启。")
+            return
+        if not messagebox.askyesno(
+            "重启 Harness",
+            "将先停止当前的 Harness，等端口释放后再重新启动。\n\n"
+            "正在进行的对话 / 任务会被中断（浏览器窗口会在启动后重新打开）。\n\n确定重启吗？",
+        ):
+            return
+        self._restart_dsh()
 
     def on_save_log(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -1355,6 +1520,7 @@ class App:
     def _make_scroll_frame(self, parent, height: int = 220):
         """在对话框里做一个可滚动区域，返回内部 Frame。"""
         canvas = tk.Canvas(parent, height=height, highlightthickness=0)
+        theme.paint(canvas, self.palette, field=False)
         sb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         inner = ttk.Frame(canvas)
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
@@ -1367,6 +1533,7 @@ class App:
     # —— 手动备份 ——
     def on_manual_backup(self) -> None:
         dlg = tk.Toplevel(self.root)
+        theme.paint_dialog(dlg, self.palette)
         dlg.title("手动备份")
         dlg.transient(self.root)
         dlg.grab_set()
@@ -1380,7 +1547,7 @@ class App:
         ttk.Checkbutton(frm, text="包含插件文件本身 node_modules（很大很慢，一般不需要）",
                         variable=var_files).pack(anchor="w")
         ttk.Label(frm, text="插件清单（名称+版本）与档案配置总是会备份。",
-                  foreground="#888").pack(anchor="w", pady=(8, 12))
+                  style="Muted.TLabel").pack(anchor="w", pady=(8, 12))
         row = ttk.Frame(frm)
         row.pack(fill="x")
 
@@ -1471,6 +1638,8 @@ class App:
             return
 
         dlg = tk.Toplevel(self.root)
+
+        theme.paint_dialog(dlg, self.palette)
         dlg.title("恢复备份")
         dlg.transient(self.root)
         dlg.grab_set()
@@ -1478,7 +1647,9 @@ class App:
         frm.pack(fill="both", expand=True)
 
         ttk.Label(frm, text="选择一个备份：", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
-        listbox = tk.Listbox(frm, height=8, width=72)
+        listbox = tk.Listbox(frm, height=8, width=72, relief="flat", bd=0,
+                             activestyle="none", highlightthickness=0)
+        theme.paint(listbox, self.palette)
         for b in backups:
             listbox.insert("end", backup_summary(b))
         listbox.pack(fill="both", expand=True, pady=(4, 10))
@@ -1493,7 +1664,7 @@ class App:
         ttk.Radiobutton(frm, text="全部还原（插件 + 历史会话 + 设置）",
                         variable=mode, value="all").pack(anchor="w")
         ttk.Label(frm, text="还原前会自动再备份一次当前状态，随时可以回退。",
-                  foreground="#888").pack(anchor="w", pady=(8, 12))
+                  style="Muted.TLabel").pack(anchor="w", pady=(8, 12))
 
         row = ttk.Frame(frm)
         row.pack(fill="x")
@@ -1598,6 +1769,8 @@ class App:
         self._set_status(f"共 {len(results)} 个插件，其中 {len(outdated)} 个有新版本")
 
         dlg = tk.Toplevel(self.root)
+
+        theme.paint_dialog(dlg, self.palette)
         dlg.title("从备份列表重新安装插件")
         dlg.transient(self.root)
         dlg.grab_set()
@@ -1683,15 +1856,30 @@ class App:
     # 启动 / 停止
     # ------------------------------------------------------------------ #
     def open_browser(self) -> None:
-        """打开浏览器；优先打开 DSH 打印的带 token 认证地址（裸地址会被 401 拒绝）。"""
-        webbrowser.open(self._ready_url or WEB_URL)
+        """打开界面。
+
+        用它自己那套「应用窗口」打开，这样启动器才管得住这个窗口
+        （关闭启动器时可以把它一起关掉）；服务还没起来时给出提示。
+        """
+        if self._ready_url is None:
+            if is_port_open(WEB_PORT):
+                messagebox.showinfo(
+                    "提示",
+                    "Harness 的服务已经在监听端口，但启动器没拿到本次的认证地址"
+                    "（通常是这次是别的程序启动的）。\n\n"
+                    "请在 Harness 自己的窗口里点开界面，或先「重启」一次由启动器接管。",
+                )
+                return
+            messagebox.showinfo("提示", "Harness 还没启动，先点「启动 Harness」吧。")
+            return
+        self._open_ready_page(self._ready_url)
 
     def on_launch(self) -> None:
         if not dsh_available():
             messagebox.showerror(
                 "未检测到 dsh",
                 "未检测到可用的全局 dsh 命令，无法启动 Harness。\n\n"
-                "请到「工具」选项卡点【安装 / 修复 DSH】自动完成安装；\n"
+                "请到「维护」选项卡点【安装 / 修复 DSH】自动完成安装；\n"
                 "也可以手动执行：npm install -g @deepseek-ai/dsh",
             )
             return
@@ -1713,10 +1901,10 @@ class App:
         self._ready_url = None      # 清空上次的地址，等待本次启动重新捕获
         self.starting = True
         suffix = f" {label}" if label else ""
-        self._set_status(f"正在启动 Harness{suffix}…（首次启动可能需下载依赖，请稍候）")
-        self.btn_launch.config(state="disabled")
-        self.btn_stop.config(state="normal")
+        self._set_status(f"正在启动 Harness{suffix}…（通常需要几秒，实时日志在下方）")
+        self._set_power_state("starting")
         self._append_log(f"[启动器] 正在启动 DeepSeek Harness{suffix} …")
+        self._start_wait_ticker()
         try:
             self.harness.launch(patch)
         except Exception as exc:  # noqa: BLE001
@@ -1724,6 +1912,28 @@ class App:
             self._finish_launch_failed(f"启动进程失败：{exc}")
             return
         threading.Thread(target=self._wait_ready, daemon=True).start()
+
+    def _start_wait_ticker(self) -> None:
+        """启动期间在状态栏转圈。
+
+        DSH 自身启动要几秒（node + 插件树，实测本机约 5~7 秒），这段时间启动器做不了别的
+        —— 但至少要让人看到"它在动"，而不是以为点了没反应。
+        """
+        self._launch_started_at = time.time()
+        self._spin_angle = 0
+        self._draw_status_dot()          # 立刻切成"转圈"形态
+        self._animate_spinner()
+
+    def _animate_spinner(self) -> None:
+        """每 80ms 把圆弧转一点。启动结束（``_spinning`` 变假）就自动停下。"""
+        if not self._spinning:
+            return
+        self._spin_angle = (self._spin_angle + 30) % 360
+        try:
+            self._status_dot.itemconfigure("spin", start=self._spin_angle)
+        except Exception:
+            pass
+        self.root.after(80, self._animate_spinner)
 
     def _wait_ready(self) -> None:
         deadline = time.time() + READY_TIMEOUT
@@ -1745,42 +1955,60 @@ class App:
 
     def _on_launch_ready(self, url: str) -> None:
         self._set_status("启动成功 ✓")
-        self._append_log(f"[启动器] 服务已就绪，正在打开浏览器：{url}")
-        webbrowser.open(url)
         self.starting = False
-        self.btn_launch.config(state="normal")
-        self.btn_stop.config(state="normal")
+        self._set_power_state("running")
+        self._open_ready_page(url)
         try:
             save_last_good()      # 记下“这次是好的”，以后出问题能一键回退
             self._append_log("[启动器] 已记录本次为「上次正常配置」。")
         except Exception:
             pass
 
+    def on_open_mode_changed(self) -> None:
+        """切换「独立窗口 / 普通标签页」并记住选择。"""
+        self.open_as_app = bool(self.open_mode_var.get())
+        self.ui_settings["open_as_app"] = self.open_as_app
+        _save_ui_settings(self.ui_settings)
+        if self.open_as_app:
+            self._append_log("[启动器] 打开方式：独立窗口（关启动器时会一并关闭它）")
+        else:
+            self._append_log("[启动器] 打开方式：默认浏览器标签页（启动器关不掉它）")
+
+    def _open_ready_page(self, url: str) -> None:
+        """按用户选的打开方式打开页面。"""
+        self._append_log(f"[启动器] 服务已就绪，正在打开界面：{endpoint_label(url)}")
+        try:
+            owned, note = self.app_window.open(url, as_app_window=self.open_as_app)
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"[启动器] 打开浏览器失败：{exc}")
+            return
+        self._append_log(f"[启动器] {note}")
+        if not owned:
+            self._append_log("[启动器] 提示：这个页面不由启动器接管，关闭启动器时无法自动关掉它。")
+
     def _on_launch_failed(self, code) -> None:
         self.starting = False
-        self.btn_launch.config(state="normal")
-        self.btn_stop.config(state="disabled")
+        self._set_power_state("failed")
         self._set_status("启动失败 ✗ 请查看错误信息，关闭可疑插件后重试")
         tail = "\n".join(self.log_tail) or "（无日志输出）"
         self._show_failed_dialog(code, tail)
 
     def _on_launch_timeout(self) -> None:
         self.starting = False
-        self.btn_launch.config(state="normal")
-        self.btn_stop.config(state="normal")
+        self._set_power_state("running")     # 进程还在，按“运行中”处理，用户可停止
         self._set_status("启动超时，可能仍在初始化，请看日志")
-        self._append_log("[启动器] 等待服务就绪超时（仍可点击“打开浏览器”手动访问）")
+        self._append_log("[启动器] 等待服务就绪超时（仍可点击“打开界面”手动访问）")
 
     def _finish_launch_failed(self, msg: str) -> None:
         self.starting = False
-        self.btn_launch.config(state="normal")
-        self.btn_stop.config(state="disabled")
+        self._set_power_state("failed")
         self._set_status("启动失败 ✗")
         self._show_failed_dialog(None, msg)
 
     def _show_failed_dialog(self, code, detail: str) -> None:
         diag = diagnose_boot_failure(detail)
         dlg = tk.Toplevel(self.root)
+        theme.paint_dialog(dlg, self.palette)
         dlg.title("启动失败")
         dlg.transient(self.root)
         dlg.grab_set()
@@ -1789,26 +2017,28 @@ class App:
         head = "Harness 启动失败"
         if code is not None:
             head += f"（退出码 {code}）"
-        ttk.Label(frm, text=head, font=("Microsoft YaHei UI", 11, "bold"), foreground="#c00").pack(anchor="w")
+        ttk.Label(frm, text=head, font=("Microsoft YaHei UI", 11, "bold"), style="Danger.TLabel").pack(anchor="w")
 
         if diag:
             # 认出已知故障时，先说人话：是什么、为什么、怎么办
             self._append_log(f"[启动器] 启动失败诊断：{diag['title']}")
             ttk.Label(frm, text="诊断：" + diag["title"],
-                      font=("Microsoft YaHei UI", 10, "bold"), foreground="#c0392b",
+                      font=("Microsoft YaHei UI", 10, "bold"), style="Danger.TLabel",
                       wraplength=460, justify="left").pack(anchor="w", pady=(8, 2))
             if diag.get("detail"):
                 ttk.Label(frm, text=diag["detail"], wraplength=460, justify="left").pack(anchor="w")
             if diag.get("hint"):
                 ttk.Label(frm, text=diag["hint"], wraplength=460, justify="left",
-                          foreground="#b26a00").pack(anchor="w", pady=(6, 0))
+                          style="Warn.TLabel").pack(anchor="w", pady=(6, 0))
             ttk.Label(frm, text="下方是原始输出，可直接复制给别人看。",
-                      foreground="#888").pack(anchor="w", pady=(10, 4))
+                      style="Muted.TLabel").pack(anchor="w", pady=(10, 4))
         else:
             ttk.Label(frm, text="下方是错误信息。请在主窗口关闭可疑插件后，重新点击“启动 Harness”。",
                       wraplength=460).pack(anchor="w", pady=(6, 8))
 
-        txt = scrolledtext.ScrolledText(frm, height=14, width=64, wrap="word")
+        txt = scrolledtext.ScrolledText(frm, height=14, width=64, wrap="word",
+                                        relief="flat", bd=0, font=(theme.FONT_MONO, 9))
+        theme.paint(txt, self.palette)
         txt.insert("1.0", detail)
         txt.configure(state="disabled")
         txt.pack(fill="both", expand=True)
@@ -1852,32 +2082,55 @@ class App:
             messagebox.showwarning("复制失败", f"无法复制到剪贴板：{exc}")
             return False
 
-    def on_stop(self) -> None:
-        self._append_log("[启动器] 正在停止 …")
-        self.harness.stop()
-        self._on_stopped()
+    def on_stop(self, manual: bool = False) -> None:
+        """停止 Harness。
 
-    def _on_stopped(self) -> None:
+        ``manual=True``：用户在主按钮上主动点的「停止」——**保留浏览器窗口**，
+        按钮变成「恢复」，方便临时停一下再拉起来。
+        其它流程里调用（重启、卸载插件前、恢复配置前）不需要保留，马上会重开新页面。
+
+        这里等 taskkill 真正杀完整棵进程树（``wait=True``）：返回后界面才说"已停止"，
+        用户紧接着点「重启」时端口才确实空着。
+        """
+        self._append_log("[启动器] 正在停止 …")
+        try:
+            self.harness.stop()          # wait=True
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"[启动器] 停止时出错：{exc}")
+        self._on_stopped(manual=manual)
+
+    def _on_stopped(self, manual: bool = True) -> None:
         self.starting = False
-        self.btn_launch.config(state="normal")
-        self.btn_stop.config(state="disabled")
-        self._set_status("已停止")
+        self._set_power_state("stopped" if manual else "idle")
+        if manual:
+            self._set_status("已停止（浏览器窗口留着，点「恢复」重新启动）")
+        else:
+            self._set_status("已停止")
         self._append_log("[启动器] 已停止。")
 
     def _on_close(self) -> None:
-        """关闭窗口前先提醒：关闭启动器会同时停止正在运行的 Harness。"""
-        if self.harness.is_running():
-            if not messagebox.askyesno(
-                "确认关闭",
-                "Harness 正在运行中。\n\n"
-                "关闭启动器会同时停止 Harness，导致正在执行的任务中断。\n"
-                "确定要关闭吗？",
-            ):
+        """关闭窗口前先提醒：会连 Harness 和它的浏览器窗口一起关掉。"""
+        owns_window = self.app_window.is_open()
+        if self.harness.is_running() or owns_window:
+            lines = ["关闭启动器会同时："]
+            if self.harness.is_running():
+                lines.append("  • 停止 Harness（正在执行的对话 / 任务会中断）")
+            if owns_window:
+                lines.append("  • 关闭为它打开的浏览器窗口")
+            lines.append("\n确定要关闭吗？")
+            if not messagebox.askyesno("确认关闭", "\n".join(lines)):
                 return  # 用户点了“否”，取消关闭，继续运行
-            try:
-                self.harness.stop()
-            except Exception:
-                pass
+        # 关启动器时**不等** taskkill：杀整棵进程树要等它退干净，界面会白等一会儿。
+        # taskkill 是独立进程，启动器退出后照样把活干完（点「停止」按钮仍会等，见 on_stop）。
+        try:
+            self.harness.stop(wait=False)
+        except Exception:
+            pass
+        try:
+            if self.app_window.close():
+                self._append_log("[启动器] 已关闭浏览器窗口。")
+        except Exception:
+            pass
         try:                                # 记住窗口大小 / 位置与深浅色
             self.ui_settings["geometry"] = self.root.winfo_geometry()
             self.ui_settings["dark"] = self.dark_mode

@@ -30,13 +30,19 @@ jobs:
           python-version: "3.13"
 
       - name: 语法自检
-        run: python -m py_compile core.py plugins.py launcher.py backup.py
+        run: python -m py_compile core.py plugins.py launcher.py backup.py theme.py browser.py
 
       - name: 安装 PyInstaller
         run: python -m pip install --upgrade pyinstaller
 
       - name: 打包单文件 exe
-        run: python -m PyInstaller --noconfirm --clean -w -F -n DSH-Launcher launcher.py
+        # --icon     ：exe 文件自身的图标（资源管理器 / 任务栏）
+        # --add-data ：把 assets 一起打进 exe，运行时靠 sys._MEIPASS 找到窗口图标
+        run: >
+          python -m PyInstaller --noconfirm --clean -w -F -n DSH-Launcher
+          --icon assets/launcher.ico
+          --add-data "assets;assets"
+          launcher.py
 
       - name: 上传构建产物（即使发布失败也能在 Actions 页面下载）
         uses: actions/upload-artifact@v7

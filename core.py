@@ -138,6 +138,20 @@ def approve_builds_cmd() -> str:
     return f"cd /d {_quote(str(profile_dir()))} && {pnpm_cmd()} approve-builds --all"
 
 
+def no_window_flags() -> int:
+    """给子进程加上 ``CREATE_NO_WINDOW``（Windows 专用；其它平台返回 0）。
+
+    **为什么必须加**：启动器是 ``pythonw`` 起的 —— 它**没有控制台**。从这种进程里启动
+    控制台程序（node / npm / pnpm / taskkill …）时，Windows 会替子进程**分配一个新控制台**；
+    而 Windows 11 的默认终端是 Windows Terminal，于是屏幕上会**冒出一个终端窗口**
+    （标题就是 ``node.EXE`` 的完整路径）—— 用户看到的就是"一启动就多了个 cmd 窗口"。
+
+    加上这个标志后，子进程**照样有控制台，只是不给它窗口**：重定向过的 stdout/stderr 照常
+    工作，也不影响 node-pty 这类自己造控制台的库。
+    """
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def child_env() -> dict:
     """构造给子进程用的环境变量。
 
@@ -171,6 +185,7 @@ def run_command(cmd: str, timeout: float = 60.0) -> subprocess.CompletedProcess:
         errors="replace",
         timeout=timeout,
         env=child_env(),
+        creationflags=no_window_flags(),   # 否则从 pythonw 里起会弹出控制台窗口
     )
 
 
@@ -183,13 +198,49 @@ def _first_nonempty_line(text: str) -> str | None:
     return None
 
 
+def dsh_entry_paths() -> tuple[Path | None, Path | None]:
+    """全局 dsh 的两个入口：``(dsh.cmd 的完整路径, lib/bin.js 的完整路径)``。
+
+    ``bin.js`` 就是 ``dsh.cmd`` 内部真正执行的脚本；直接用它启动可以少一层
+    ``cmd.exe``（见 :func:`dsh_launch_parts`）。
+    """
+    appdata = os.environ.get("APPDATA", "").strip()
+    if not appdata:
+        return None, None
+    base = Path(appdata) / "npm"
+    cmd = base / "dsh.cmd"
+    bin_js = (base / "node_modules" / "@deepseek-ai" / "dsh" / "lib" / "bin.js")
+    return (cmd if cmd.is_file() else None,
+            bin_js if bin_js.is_file() else None)
+
+
+def dsh_launch_spec() -> tuple[list, bool]:
+    """启动 dsh 的参数：``(参数列表, 是否需要经 shell)``。
+
+    优先 ``node <全局安装>/…/lib/bin.js`` —— 这正是 ``dsh.cmd`` 内部执行的命令，
+    但**少套一层 cmd.exe**：启动更快，而且进程树里少一个中间层，停止时能直接对
+    node 下手（PID 更准、杀得更快）。找不到才退回 ``dsh.cmd``（.cmd 必须经 shell）。
+    """
+    cmd_path, bin_js = dsh_entry_paths()
+    node = shutil.which("node") or ""
+    if bin_js is not None and node:
+        return [node, str(bin_js)], False
+    if cmd_path is not None:
+        return [_quote(str(cmd_path))], True
+    return ["dsh"], True
+
+
 def dsh_available() -> bool:
-    """检测全局 ``dsh`` 命令是否可用（是否已 ``npm install -g @deepseek-ai/dsh``）。"""
-    try:
-        proc = run_command(f"{dsh_cmd()} --version", timeout=30)
-        return proc.returncode == 0
-    except Exception:
-        return False
+    """全局 ``dsh`` 是否可用（是否已 ``npm install -g @deepseek-ai/dsh``）。
+
+    **故意不跑 ``dsh --version``**：那要起一个 node 进程（实测约 1 秒），而它是在点
+    「启动 Harness」时同步调用的 —— 用户会明显感觉"点了没反应"。这里只查入口文件在不在，
+    毫秒级返回；真的坏掉了，启动过程本身会立刻报错并显示在日志/弹窗里。
+    """
+    cmd_path, bin_js = dsh_entry_paths()
+    if cmd_path is not None or bin_js is not None:
+        return True
+    return bool(shutil.which("dsh"))
 
 
 def get_installed_version(timeout: float = 90.0) -> str | None:
@@ -323,6 +374,7 @@ def stream_command(cmd: str, line_callback, timeout: float | None = None) -> int
         errors="replace",
         bufsize=1,
         env=child_env(),
+        creationflags=no_window_flags(),
     )
     try:
         if proc.stdout is not None:
@@ -367,17 +419,19 @@ class HarnessProcess:
         """启动 ``dsh web``（可选附加禁用补丁）。日志通过 log_callback 逐行回调。"""
         if self.is_running():
             return
-        parts = [dsh_cmd(), "web"]
+        # 优先 node + bin.js（不经 shell，少一层 cmd.exe）；找不到才退回 dsh.cmd
+        parts, use_shell = dsh_launch_spec()
+        parts = list(parts) + ["web"]
         if patch_file is not None and patch_file.exists():
             parts += ["--patch", _quote(str(patch_file))]
         # DSH web 默认会自动打开一次浏览器；这里用 --no-open 关掉它，
         # 改由启动器在确认服务就绪后只打开一次，避免出现两个相同标签页。
         parts += ["--no-open"]
-        cmd = " ".join(parts)
+        cmd = " ".join(parts) if use_shell else parts
 
         self.proc = subprocess.Popen(
             cmd,
-            shell=True,
+            shell=use_shell,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,   # 合并错误输出到同一个流
             text=True,
@@ -385,6 +439,8 @@ class HarnessProcess:
             errors="replace",
             bufsize=1,                  # 行缓冲，便于实时看到日志
             env=child_env(),            # 不把打包器的 Tcl 临时路径泄漏给 dsh
+            # ★ 关键：不加这个，Win11 会为这个 node 分配一个控制台并弹出一个终端窗口
+            creationflags=no_window_flags(),
         )
         self._reader_thread = threading.Thread(target=self._read_output, daemon=True)
         self._reader_thread.start()
@@ -401,19 +457,30 @@ class HarnessProcess:
             # 读管道出错（例如进程被我们主动杀掉）不必抛出
             pass
 
-    def stop(self) -> None:
-        """停止 DSH（连同它的子进程一起）。"""
+    def stop(self, wait: bool = True) -> None:
+        """停止 DSH（连同它的子进程一起）。
+
+        ``wait=True``（默认）：等 ``taskkill`` 把整棵进程树杀完再返回 —— 点「停止」按钮
+        时用这个，返回后界面才说"已停止"，用户可以马上重启（端口也确实空了）。
+
+        ``wait=False``：**只把 taskkill 发出去就返回**。关闭启动器（点 X）时用这个 ——
+        ``taskkill /T /F`` 要等一整棵进程树退干净，实测能让界面白等几百毫秒到数秒；
+        而 taskkill 是一个独立进程，启动器退出后它照样会把活干完，所以没必要等。
+        """
         if self.proc is None:
             return
         pid = self.proc.pid
-        # /T 表示杀掉整棵进程树（cmd -> npx -> node），/F 强制
+        # /T = 连同整棵进程树，/F = 强制
+        cmd = f"taskkill /PID {pid} /T /F"
         try:
-            subprocess.run(
-                f"taskkill /PID {pid} /T /F",
-                shell=True,
-                capture_output=True,
-                timeout=15,
-            )
+            if wait:
+                subprocess.run(cmd, shell=True, capture_output=True, timeout=15,
+                               creationflags=no_window_flags())
+            else:
+                subprocess.Popen(cmd, shell=True,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 creationflags=no_window_flags())
         except Exception:
             pass
         try:
