@@ -21,6 +21,8 @@ import shutil
 import socket
 import subprocess
 import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # DSH 家目录环境变量名
@@ -136,6 +138,31 @@ def approve_builds_cmd() -> str:
     但插件层登记（``dsh.profile.bundles``）被跳过，表现为「装了但不生效」。
     """
     return f"cd /d {_quote(str(profile_dir()))} && {pnpm_cmd()} approve-builds --all"
+
+
+def probe_url(url: str, timeout: float = 4.0) -> tuple[bool, str]:
+    """对本地服务做一次健康检查（GET 一下）。返回 ``(宿主是否在应答, 说明)``。
+
+    两个必须注意的点：
+
+    1. **显式清空代理**：Python 的 urllib 在 Windows 上会去读系统代理（注册表里的 WinINET 设置），
+       而用户很可能正开着 Clash 的系统代理 —— 那样连 ``127.0.0.1`` 都会被送去代理，
+       检查必然误报成"无响应"。所以这里用一个不带 ProxyHandler 的 opener。
+    2. **有 HTTP 回应就算活着**：只要服务器回了任何状态码，就说明宿主进程还在处理请求
+       （哪怕 4xx/5xx 也证明它在应答）；只有连接失败 / 超时才算"无响应" ——
+       那种情况正是用户看到的"页面一直自动重连中"。
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    request = urllib.request.Request(url, headers={"User-Agent": "DSH-Launcher-health"})
+    try:
+        with opener.open(request, timeout=timeout) as resp:
+            code = getattr(resp, "status", 200) or 200
+            resp.read(2048)          # 只读一点，别把整页拉下来
+            return True, f"HTTP {code}"
+    except urllib.error.HTTPError as exc:
+        return True, f"HTTP {exc.code}（宿主在应答）"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def no_window_flags() -> int:

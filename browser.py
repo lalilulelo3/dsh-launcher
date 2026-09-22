@@ -155,6 +155,14 @@ class AppWindow:
         """我们启动的那个窗口是否还活着（只看自己启动的进程，不做全表扫描）。"""
         return self._proc is not None and self._proc.poll() is None
 
+    def window_gone(self) -> bool:
+        """我们**开过**窗口，但它现在不在了（被关掉，或进程自己崩了）。
+
+        用来提示用户「服务是好的，只是那个窗口没了，点『打开界面』可以重开」——
+        这跟"服务无响应"是两回事，不能混为一谈。
+        """
+        return bool(self._ever_opened) and not self.is_open()
+
     def open(self, url: str, as_app_window: bool = True) -> tuple[bool, str]:
         """打开网页。
 

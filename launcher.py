@@ -46,6 +46,7 @@ from core import (
     ui_settings_path,
     run_command,
     approve_builds_cmd,
+    probe_url,
 )
 from plugins import (
     list_plugins,
@@ -73,7 +74,7 @@ from backup import (
 )
 
 # 启动器自身的版本号（发布 Release 时与 git tag 对应）
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # 首次启动可能要走 npx 下载依赖，因此给足等待时间（秒）
 READY_TIMEOUT = 180
@@ -150,6 +151,11 @@ class App:
         self._bundles_before = []      # 命令执行前的插件层清单（用于判断“需要重启”）
         self._last_inventory = None    # 最近一次插件清点结果（换主题时重画用，不重新读档案）
         self._restart_deadline = 0.0   # 自动重启时等待端口释放的截止时间
+        self._health_stop = True       # 健康检查线程是否该停
+        self._health_fails = 0         # 连续失败次数
+        self._health_state = "off"     # off / ok / bad / dead
+        self._health_thread = None
+        self._window_gone_reported = False   # 「服务正常但窗口没了」只提示一次
         self.ui_settings = _load_ui_settings()
         self.dark_mode = bool(self.ui_settings.get("dark", False))
         # 打开方式：True = 独立应用窗口（可随启动器关闭）；False = 默认浏览器标签页
@@ -484,6 +490,9 @@ class App:
             self._on_launch_timeout()
         elif tag == "stopped":
             self._on_stopped()
+        elif tag == "health":
+            # item = (tag, "ok"|"bad"|"dead", 说明)
+            self._on_health(item[1], item[2])
 
     def _on_log_line(self, line: str) -> None:
         # 运行在后台读线程里：只入队，不碰界面
@@ -1177,18 +1186,36 @@ class App:
             self.refresh_plugins()
 
     def _restart_dsh(self) -> None:
-        """停掉再启动（「重启」按钮，以及插件层变动后的自动重启）。
+        """重启：**先关掉旧窗口 → 立刻转圈 → 再停服务 → 等端口释放 → 重新启动**。
 
-        停下时不保留旧浏览器窗口——重启后 token 会变，旧页面已经失效；
-        启动成功时会自动换成新页面。
+        顺序是用户反馈后改的。原来的顺序是「停服务 → 等端口 → 启动 → 就绪 → 才换窗口」，
+        结果那个卡住的旧窗口会在整个过程里一直杵在屏幕上（好几秒），用户既看不出
+        "是不是在重启"，也不知道该不该等。现在一按下去就有明确反馈：
+
+        - 旧窗口**立刻**关掉（它本来就是失效的）；
+        - 状态灯**立刻**变成转圈的动画；
+        - 服务停下、端口释放、重新启动（这几步本来就免不了），就绪后自动开新窗口。
         """
-        self._append_log("[启动器] 正在重启 Harness …")
+        self._append_log("[启动器] 正在重启 Harness（先关旧窗口，再停服务，然后重新启动）…")
+        self._stop_health_monitor()
+        # ① 先关旧窗口（勾了独立窗口才有；标签页模式关不掉，只能留在那儿）
         try:
-            self.on_stop()          # manual=False：不保留旧窗口
+            if self.app_window.close():
+                self._append_log("[启动器] 已关闭旧的浏览器窗口。")
         except Exception:
             pass
+        # ② 立刻进入"启动中"：状态灯转圈、主按钮变「停止」
+        self.starting = True
+        self._set_power_state("starting")
+        self._set_status("正在重启 Harness…（旧窗口已关闭，稍后会打开新窗口）")
+        self._start_wait_ticker()
+        # ③ 停服务（等它真的退干净），④ 等端口释放后重新启动
+        try:
+            self.harness.stop()
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"[启动器] 停止时出错：{exc}")
         self._restart_deadline = time.time() + 30
-        self.root.after(800, self._restart_when_port_free)
+        self.root.after(600, self._restart_when_port_free)
 
     def _restart_when_port_free(self) -> None:
         """等端口真正释放后再启动，避免撞上「端口已被占用」的提示。"""
@@ -1935,6 +1962,107 @@ class App:
             pass
         self.root.after(80, self._animate_spinner)
 
+    # ------------------------------------------------------------------ #
+    # 健康检查：让用户知道"到底发生了什么"
+    # ------------------------------------------------------------------ #
+    # 用户能看到的现象（页面「自动重连中」、对话卡住）其实有三种完全不同的原因：
+    #   ① 宿主进程没了      ② 宿主还在但对请求没反应（卡住）    ③ 宿主一切正常、是页面/窗口自己掉线
+    # 启动器没法直接看页面的 WebSocket，但能把这三种区分开 —— 这就够告诉用户该干什么了。
+    HEALTH_INTERVAL = 5.0          # 每次检查间隔（秒）
+    HEALTH_FAILS_TO_WARN = 2       # 连续失败几次才告警（避免偶发抖动就报警）
+
+    def _start_health_monitor(self) -> None:
+        self._health_stop = False
+        self._health_fails = 0
+        # 刚启动检查时**视为正常**：否则第一次成功会被当成"从故障恢复"，平白写一行日志
+        self._health_state = "ok"
+        self._health_thread = threading.Thread(target=self._health_loop, daemon=True)
+        self._health_thread.start()
+
+    def _stop_health_monitor(self) -> None:
+        """只让线程停下。
+
+        **不要**在这里改 ``_health_state`` —— 它记录的是"最后已知的服务状态"（比如 dead），
+        清掉它会把"宿主已退出"这个结论丢掉（测试抓到过）。
+        """
+        self._health_stop = True
+
+    def _health_loop(self) -> None:
+        """后台线程：定时看宿主进程是否还在、是否还在应答 HTTP 请求。"""
+        url = self._ready_url
+        while not self._health_stop:
+            time.sleep(self.HEALTH_INTERVAL)
+            if self._health_stop:
+                return
+            if not self.harness.is_running():
+                self._post(("health", "dead", "宿主进程已退出"))
+                return
+            if not url:
+                continue
+            ok, detail = probe_url(url, timeout=4.0)
+            self._post(("health", "ok" if ok else "bad", detail))
+
+    def _on_health(self, state: str, detail: str) -> None:
+        """健康检查结果回到主线程后的处理：只在**状态发生变化**时改界面/写日志。
+
+        为什么只在变化时动：状态栏和日志还可能显示别的重要信息（比如"已禁用插件 X"），
+        每 5 秒覆盖一次会把这些冲掉，反而更乱。
+        """
+        if state == "dead":
+            if self._health_state != "dead":
+                self._health_state = "dead"
+                self._stop_health_monitor()
+                self._set_power_state("failed")
+                self._set_status("宿主进程已退出 —— 服务已停（页面会一直显示「自动重连中」）")
+                self._append_log("[启动器] 健康检查：宿主进程已退出（不是我停的）。"
+                                 "可点「启动 Harness」重新拉起；日志上方可能有它的最后遗言。")
+            return
+
+        if state == "ok":
+            self._health_fails = 0
+            if self._health_state != "ok":
+                self._health_state = "ok"
+                self._set_status_dot("ok")
+                self._set_status("服务已恢复正常 ✓")
+                self._append_log(f"[启动器] 健康检查：服务恢复正常（{detail}）。")
+            self._check_app_window_alive()
+            return
+
+        # state == "bad"：宿主还在，但对 HTTP 请求没反应
+        self._health_fails += 1
+        if self._health_fails < self.HEALTH_FAILS_TO_WARN:
+            return
+        if self._health_state != "bad":
+            self._health_state = "bad"
+            self._set_status_dot("warn")
+            self._set_status(f"⚠ 服务无响应（连续 {self._health_fails} 次）· 页面多半正显示「自动重连中」")
+            self._append_log(f"[启动器] 健康检查：连续 {self._health_fails} 次访问本地服务无响应（{detail}）。")
+            self._append_log("[启动器] 含义：宿主进程**还在**，但它没有应答请求 —— "
+                             "页面此时通常显示「自动重连中」、正在进行的对话也会卡住。")
+            self._append_log("[启动器] 常见原因：① 机器正忙、宿主被卡住；"
+                             "② 本地回环流量被代理/VPN 劫持（Clash 开 TUN 时尤其要注意）；"
+                             "③ 宿主内部出问题。")
+            self._append_log("[启动器] 建议：先点「打开界面」重开页面；仍不行就点「重启」"
+                             "（重启会先关窗口、再停服务、然后重新启动）。")
+
+    def _check_app_window_alive(self) -> None:
+        """服务一切正常，但我们开的那个独立窗口已经不在了 —— 提示一次。
+
+        这是第三类情况：「宿主没事、只是窗口掉了」。用户看到的现象和"服务卡住"很像
+        （页面连不上），但处理办法完全不同（重开窗口即可，不用重启服务）。
+        """
+        if not self.open_as_app or self._window_gone_reported:
+            return
+        try:
+            gone = self.app_window.window_gone()
+        except Exception:
+            return
+        if gone:
+            self._window_gone_reported = True
+            self._set_status("服务正常，但独立窗口已关闭 —— 点「打开界面」可重开")
+            self._append_log("[启动器] 健康检查：服务正常，但之前打开的独立窗口已经不在了"
+                             "（被关掉，或浏览器进程退出了）。点「打开界面」即可重开一个。")
+
     def _wait_ready(self) -> None:
         deadline = time.time() + READY_TIMEOUT
         while time.time() < deadline:
@@ -1958,6 +2086,7 @@ class App:
         self.starting = False
         self._set_power_state("running")
         self._open_ready_page(url)
+        self._start_health_monitor()      # 之后就靠它盯着"服务还在不在、还答不答理"
         try:
             save_last_good()      # 记下“这次是好的”，以后出问题能一键回退
             self._append_log("[启动器] 已记录本次为「上次正常配置」。")
@@ -1983,11 +2112,14 @@ class App:
             self._append_log(f"[启动器] 打开浏览器失败：{exc}")
             return
         self._append_log(f"[启动器] {note}")
+        if owned:
+            self._window_gone_reported = False   # 新窗口开出来了，之前的"窗口没了"提示可以重来
         if not owned:
             self._append_log("[启动器] 提示：这个页面不由启动器接管，关闭启动器时无法自动关掉它。")
 
     def _on_launch_failed(self, code) -> None:
         self.starting = False
+        self._stop_health_monitor()
         self._set_power_state("failed")
         self._set_status("启动失败 ✗ 请查看错误信息，关闭可疑插件后重试")
         tail = "\n".join(self.log_tail) or "（无日志输出）"
@@ -1998,9 +2130,11 @@ class App:
         self._set_power_state("running")     # 进程还在，按“运行中”处理，用户可停止
         self._set_status("启动超时，可能仍在初始化，请看日志")
         self._append_log("[启动器] 等待服务就绪超时（仍可点击“打开界面”手动访问）")
+        self._start_health_monitor()         # 没等到就绪行，就更需要盯着它到底活没活
 
     def _finish_launch_failed(self, msg: str) -> None:
         self.starting = False
+        self._stop_health_monitor()
         self._set_power_state("failed")
         self._set_status("启动失败 ✗")
         self._show_failed_dialog(None, msg)
@@ -2101,6 +2235,7 @@ class App:
 
     def _on_stopped(self, manual: bool = True) -> None:
         self.starting = False
+        self._stop_health_monitor()
         self._set_power_state("stopped" if manual else "idle")
         if manual:
             self._set_status("已停止（浏览器窗口留着，点「恢复」重新启动）")
@@ -2110,6 +2245,7 @@ class App:
 
     def _on_close(self) -> None:
         """关闭窗口前先提醒：会连 Harness 和它的浏览器窗口一起关掉。"""
+        self._stop_health_monitor()
         owns_window = self.app_window.is_open()
         if self.harness.is_running() or owns_window:
             lines = ["关闭启动器会同时："]
