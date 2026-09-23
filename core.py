@@ -247,13 +247,16 @@ def dsh_launch_spec() -> tuple[list, bool]:
     优先 ``node <全局安装>/…/lib/bin.js`` —— 这正是 ``dsh.cmd`` 内部执行的命令，
     但**少套一层 cmd.exe**：启动更快，而且进程树里少一个中间层，停止时能直接对
     node 下手（PID 更准、杀得更快）。找不到才退回 ``dsh.cmd``（.cmd 必须经 shell）。
+
+    ⚠ 返回的参数**一律不带引号**：不经 shell 时是直接交给 CreateProcess 的参数数组，
+    引号会原样变成参数的一部分；需要经 shell 时，由调用方逐个引号化（见 quote_arg）。
     """
     cmd_path, bin_js = dsh_entry_paths()
     node = shutil.which("node") or ""
     if bin_js is not None and node:
         return [node, str(bin_js)], False
     if cmd_path is not None:
-        return [_quote(str(cmd_path))], True
+        return [str(cmd_path)], True
     return ["dsh"], True
 
 
@@ -446,15 +449,20 @@ class HarnessProcess:
         """启动 ``dsh web``（可选附加禁用补丁）。日志通过 log_callback 逐行回调。"""
         if self.is_running():
             return
-        # 优先 node + bin.js（不经 shell，少一层 cmd.exe）；找不到才退回 dsh.cmd
-        parts, use_shell = dsh_launch_spec()
-        parts = list(parts) + ["web"]
+        # 先按"参数数组"拼（不带引号），最后再决定要不要为 shell 加引号
+        argv, use_shell = dsh_launch_spec()
+        argv = list(argv) + ["web"]
         if patch_file is not None and patch_file.exists():
-            parts += ["--patch", _quote(str(patch_file))]
+            argv += ["--patch", str(patch_file)]
         # DSH web 默认会自动打开一次浏览器；这里用 --no-open 关掉它，
         # 改由启动器在确认服务就绪后只打开一次，避免出现两个相同标签页。
-        parts += ["--no-open"]
-        cmd = " ".join(parts) if use_shell else parts
+        argv += ["--no-open"]
+        # ★ 列表形式（不经 shell）**绝不能**给参数加引号：引号会变成参数的一部分，
+        #   dsh 收到的就不是绝对路径了。v1.1.0 起踩过这个坑 —— 家里那台报
+        #   `failed to read overlay D:\"C:\Users\…\disabled.patch.yml"`：
+        #   参数以引号开头 → Node 当成相对路径 → 前缀上了当前盘符 D:。
+        #   只有拼成一条 shell 字符串时才需要逐个加引号。
+        cmd = " ".join(quote_arg(a) for a in argv) if use_shell else argv
 
         self.proc = subprocess.Popen(
             cmd,
