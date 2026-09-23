@@ -32,6 +32,11 @@ jobs:
       - name: 语法自检
         run: python -m py_compile core.py plugins.py launcher.py backup.py theme.py browser.py
 
+      - name: 回归测试
+        # 目前主要钉住"启动参数不许带引号"这条（v1.1.0 因此发过一个启动必然失败的版本）。
+        # 测试全部用 mock，不需要装 dsh、也不会启动任何进程。
+        run: python -m unittest discover -s tests -v
+
       - name: 安装 PyInstaller
         run: python -m pip install --upgrade pyinstaller
 
