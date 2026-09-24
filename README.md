@@ -1,5 +1,14 @@
 # DeepSeek Harness 启动器（图形界面）
 
+**像管 App 一样管 DSH 插件**：勾选开关、检查更新、档案备份与回滚、启动失败一键自救。
+Windows 双击即用，**不用会命令行**，也**不会删你的数据**。
+
+![最新版本](https://img.shields.io/github/v/release/lalilulelo3/dsh-launcher?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&color=2f6feb)
+![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Windows-0078D4)
+![许可证](https://img.shields.io/github/license/lalilulelo3/dsh-launcher?label=%E8%AE%B8%E5%8F%AF%E8%AF%81)
+
+![界面预览](screenshots/01-home.png)
+
 一个用 Python + tkinter 写的 **DeepSeek Harness 启动器**，用于管理已安装的插件，
 尤其是当某个插件导致 Harness 启动失败时，能帮你**不删任何数据**地把它关掉再重试。
 
@@ -13,7 +22,8 @@
 > **已修复于 v1.2.1。** 暂时不升级的绕过办法：在启动器里把**所有插件都启用**
 > （那时不会传 `--patch`），或删掉 `~/.dsh/launcher` 下的禁用状态后重启启动器。
 
-**不想装 Python？** 直接到 [Releases](../../releases) 页面下载 `DSH-Launcher.exe`，双击即可运行。
+**不想装 Python？** 到 **[最新版本](../../releases/latest)** 下载 `DSH-Launcher.exe`，双击就能跑
+—— 不用装 Python，也不用会命令行。
 
 想用源码：克隆本仓库后双击 `启动器.bat`（或 `python launcher.py`）即可，无需安装任何第三方库。
 
